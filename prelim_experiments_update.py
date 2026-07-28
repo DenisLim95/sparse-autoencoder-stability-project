@@ -7,13 +7,17 @@ SAE stability project — preliminary experiments.
 # Install dependencies (run this cell first in Colab)
 # pip install transformer_lens sae_lens datasets torch
 
+import json
+import os
 import re
+import time
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+from pathlib import Path
 from tqdm.auto import tqdm
 from typing import Tuple, List, Dict
 from transformer_lens import HookedTransformer
@@ -35,6 +39,52 @@ CONFIG = {
 }
 
 print(f"Using device: {CONFIG['device']}")
+
+# Token budgets at which an SAE checkpoint is saved, so stability can be compared
+# across training scale.
+CHECKPOINT_TOKENS = [1_000_000_000, 5_000_000_000, 8_000_000_000]
+
+# Consecutive entries in CHECKPOINT_TOKENS are up to 4B tokens apart -- far more than a
+# single Colab session can cover. Without a rolling checkpoint in between, a disconnect
+# part-way through a gap rewinds to the previous milestone, so a run can bounce off the
+# same gap forever without advancing. This bounds the loss from a disconnect instead.
+CHECKPOINT_EVERY_SECONDS = 900
+
+# How often (in optimizer steps) to record a point on the training curves.
+LOG_EVERY_STEPS = 200
+
+# --- Persistent output directory ---------------------------------------------
+# An 8B-token run will outlive the session that started it, so results must land
+# somewhere that survives a disconnect.
+#   - SAE_RESULTS_BASE: set this on any host with a persistent volume (e.g. JupyterHub,
+#     where there is no Drive to mount) to keep results off ephemeral scratch space.
+#   - Colab: mount Drive. The already-mounted check comes first because drive.mount()
+#     needs the notebook's auth flow and fails from a subprocess (`!python ...`).
+if os.environ.get("SAE_RESULTS_BASE"):
+    RESULTS_BASE = os.environ["SAE_RESULTS_BASE"]
+elif Path("/content/drive/MyDrive").exists():
+    RESULTS_BASE = "/content/drive/MyDrive/sae-stability-outputs"
+else:
+    try:
+        from google.colab import drive
+
+        drive.mount("/content/drive")
+        RESULTS_BASE = "/content/drive/MyDrive/sae-stability-outputs"
+    except (ImportError, ModuleNotFoundError):
+        RESULTS_BASE = "outputs"
+
+_layer = CONFIG["hook_point"].split(".")[1]
+RUN_NAME = f"{CONFIG['model_name']}_L{_layer}_{max(CHECKPOINT_TOKENS) // 1_000_000_000}Btok"
+OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
+# Set to a Hub repo you have write access to in order to mirror checkpoints remotely.
+# Pointing this at someone else's repo is worse than leaving it None: the upload fails on
+# auth, the failure is only warned about, and training continues persisting nothing.
+HF_REPO_ID = None
+
+print(f"Results will be saved to: {OUTPUT_DIR}")
 
 """## 1. Load Model and Set Up Activation Streaming"""
 
@@ -149,8 +199,6 @@ class SparseAutoencoder(nn.Module):
 
 """## 3. Train SAEs with Different Seeds (streaming + checkpointed)"""
 
-from pathlib import Path
-
 
 def remove_parallel_component(W_dec: torch.Tensor, W_dec_grad: torch.Tensor) -> torch.Tensor:
     """Project out the gradient component parallel to each (unit-norm) decoder column,
@@ -159,41 +207,123 @@ def remove_parallel_component(W_dec: torch.Tensor, W_dec_grad: torch.Tensor) -> 
     return W_dec_grad - parallel_component
 
 
-def train_sae_single_seed(seed, activation_stream, config, checkpoint_tokens, checkpoint_dir, hf_repo_id=None):
-    """Train one SAE for a given seed, saving a checkpoint at each token count in
-    checkpoint_tokens. Resumes from the latest existing checkpoint for this seed if found.
-    If hf_repo_id is given (e.g. "username/sae-stability-checkpoints"), each
-    checkpoint is also pushed to that Hugging Face model repo immediately after saving
-    locally -- so a crash after the last checkpoint only costs the current interval,
-    not the whole run."""
+def empty_history() -> Dict[str, list]:
+    return {
+        "step": [],
+        "tokens_seen": [],
+        "recon_loss": [],
+        "sparsity_loss": [],
+        "l1_term": [],
+        "total_loss": [],
+        "l0": [],
+        "dead_frac": [],
+    }
+
+
+def save_checkpoint_atomic(state: dict, path: Path):
+    """Write to a temp file and rename, so a disconnect mid-save can't leave a truncated
+    checkpoint that breaks the next resume."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(state, tmp)
+    os.replace(tmp, path)
+
+
+def load_resume_state(checkpoint_dir: Path, seed: int):
+    """Return whichever checkpoint for this seed is furthest along: the rolling `_latest`
+    file or the newest milestone. Milestones are sorted by their ACTUAL token count, not
+    alphabetically -- "...tokens5000000000.pt" would otherwise sort after
+    "...tokens1000000000.pt" since '5' > '1', even though 5B > 1B."""
+    candidates = [checkpoint_dir / f"seed{seed}_latest.pt"]
+    candidates += sorted(
+        checkpoint_dir.glob(f"seed{seed}_tokens*.pt"),
+        key=lambda p: int(re.search(r"tokens(\d+)\.pt", p.name).group(1)),
+    )[-1:]
+
+    best = None
+    for path in candidates:
+        if not path.exists():
+            continue
+        try:
+            # Explicit weights_only=False: these are our own checkpoints and they carry
+            # optimizer/config/history alongside the weights. Newer torch flips the default
+            # to True, which would break resume part-way through a multi-day run.
+            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        except Exception as e:
+            print(f"[seed {seed}] ignoring unreadable checkpoint {path.name}: {e}")
+            continue
+        if best is None or ckpt["tokens_seen"] > best["tokens_seen"]:
+            best = ckpt
+    return best
+
+
+def train_sae_single_seed(
+    seed,
+    activation_stream,
+    config,
+    checkpoint_tokens,
+    checkpoint_dir,
+    hf_repo_id=None,
+    checkpoint_every_seconds=CHECKPOINT_EVERY_SECONDS,
+    log_every_steps=LOG_EVERY_STEPS,
+):
+    """Train one SAE for a given seed, saving a milestone checkpoint at each token count in
+    checkpoint_tokens plus a rolling `_latest` checkpoint every checkpoint_every_seconds.
+    Resumes from whichever of the two is furthest along. If hf_repo_id is given, milestone
+    checkpoints are also pushed to that Hugging Face model repo.
+
+    Returns (sae, history), where history holds the training curves.
+    """
     device = config["device"]
+    checkpoint_dir = Path(checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     sae = SparseAutoencoder(config["d_model"], config["n_features"], seed=seed).to(device)
     optimizer = torch.optim.Adam(sae.parameters(), lr=config["lr"])
 
     checkpoint_tokens = sorted(checkpoint_tokens)
-    next_checkpoint_idx = 0
     tokens_seen = 0
-    Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
+    step = 0
+    history = empty_history()
 
     if hf_repo_id is not None:
         from huggingface_hub import HfApi
         hf_api = HfApi()
 
-    # Resume if a checkpoint for this seed already exists
-    # Sort by the ACTUAL token count (numeric), not alphabetically by filename --
-    # "...tokens50000000.pt" would otherwise sort after "...tokens100000000.pt"
-    # since '5' > '1' as the first character, even though 50M < 100M.
-    existing = sorted(
-        Path(checkpoint_dir).glob(f"seed{seed}_tokens*.pt"),
-        key=lambda p: int(re.search(r"tokens(\d+)\.pt", p.name).group(1)),
-    )
-    if existing:
-        ckpt = torch.load(existing[-1])
-        sae.load_state_dict(ckpt["model_state_dict"])
-        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        tokens_seen = ckpt["tokens_seen"]
-        next_checkpoint_idx = sum(t <= tokens_seen for t in checkpoint_tokens)
+    resume = load_resume_state(checkpoint_dir, seed)
+    if resume is not None:
+        sae.load_state_dict(resume["model_state_dict"])
+        optimizer.load_state_dict(resume["optimizer_state_dict"])
+        tokens_seen = resume["tokens_seen"]
+        step = resume.get("step", 0)
+        history = resume.get("history", empty_history())
         print(f"[seed {seed}] resumed at {tokens_seen:,} tokens")
+        print(f"[seed {seed}] CAVEAT: the activation stream restarts from the beginning of "
+              f"the dataset, so tokens already trained on will be seen again. The token "
+              f"counts below therefore measure optimization steps, not unique tokens.")
+
+    next_checkpoint_idx = sum(t <= tokens_seen for t in checkpoint_tokens)
+    if next_checkpoint_idx >= len(checkpoint_tokens):
+        print(f"[seed {seed}] already at {tokens_seen:,} tokens; nothing left to train.")
+        return sae, history
+
+    history_path = checkpoint_dir.parent / f"training_history_seed{seed}.json"
+    # Accumulate curve metrics as on-device tensors and only pull them to the host at
+    # logging time; calling .item() every step would force a GPU sync 244k times per seed.
+    interval_sums = torch.zeros(4, device=device)  # recon, sparsity, total, l0
+    interval_n = 0
+    seen_active = torch.zeros(config["n_features"], dtype=torch.bool, device=device)
+    last_checkpoint_time = time.time()
+
+    def build_state():
+        return {
+            "model_state_dict": sae.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "tokens_seen": tokens_seen,
+            "step": step,
+            "seed": seed,
+            "config": config,
+            "history": history,
+        }
 
     for batch in activation_stream:
         batch = batch.to(device)
@@ -211,18 +341,47 @@ def train_sae_single_seed(seed, activation_stream, config, checkpoint_tokens, ch
         # from activation_stream_generator -- batch.shape[0] IS the real token count
         # for this step. Do NOT multiply by seq_len again (that was double-counting).
         tokens_seen += batch.shape[0]
+        step += 1
+
+        with torch.no_grad():
+            active = f > 0
+            interval_sums[0] += loss_dict["recon_loss"].detach()
+            interval_sums[1] += loss_dict["sparsity_loss"].detach()
+            interval_sums[2] += loss.detach()
+            interval_sums[3] += active.float().sum(dim=1).mean()
+            interval_n += 1
+            seen_active |= active.any(dim=0)
+
+        if step % log_every_steps == 0:
+            recon, sparsity, total, l0 = (interval_sums / interval_n).tolist()
+            history["step"].append(step)
+            history["tokens_seen"].append(tokens_seen)
+            history["recon_loss"].append(recon)
+            history["sparsity_loss"].append(sparsity)
+            history["l1_term"].append(config["l1_coeff"] * sparsity)
+            history["total_loss"].append(total)
+            history["l0"].append(l0)
+            # Dead = never fired anywhere in this logging window.
+            history["dead_frac"].append(1.0 - seen_active.float().mean().item())
+            print(f"[seed {seed}] step {step:>7} | {tokens_seen:>14,} tok | "
+                  f"recon {recon:.5f} | l1_term {config['l1_coeff'] * sparsity:.5f} | "
+                  f"L0 {l0:6.1f} | dead {100 * history['dead_frac'][-1]:5.1f}%")
+            interval_sums.zero_()
+            interval_n = 0
+            seen_active = torch.zeros(config["n_features"], dtype=torch.bool, device=device)
+
+        if time.time() - last_checkpoint_time >= checkpoint_every_seconds:
+            save_checkpoint_atomic(build_state(), checkpoint_dir / f"seed{seed}_latest.pt")
+            with open(history_path, "w") as fh:
+                json.dump(history, fh)
+            last_checkpoint_time = time.time()
+            print(f"[seed {seed}] rolling checkpoint at {tokens_seen:,} tokens")
 
         if next_checkpoint_idx < len(checkpoint_tokens) and tokens_seen >= checkpoint_tokens[next_checkpoint_idx]:
             ckpt_name = f"seed{seed}_tokens{checkpoint_tokens[next_checkpoint_idx]}.pt"
-            ckpt_path = Path(checkpoint_dir) / ckpt_name
-            torch.save({
-                "model_state_dict": sae.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "tokens_seen": tokens_seen,
-                "seed": seed,
-                "config": config,
-            }, ckpt_path)
-            print(f"[seed {seed}] checkpoint saved locally at {tokens_seen:,} tokens")
+            ckpt_path = checkpoint_dir / ckpt_name
+            save_checkpoint_atomic(build_state(), ckpt_path)
+            print(f"[seed {seed}] milestone checkpoint saved at {tokens_seen:,} tokens")
 
             if hf_repo_id is not None:
                 try:
@@ -243,18 +402,15 @@ def train_sae_single_seed(seed, activation_stream, config, checkpoint_tokens, ch
         if next_checkpoint_idx >= len(checkpoint_tokens):
             break
 
-    return sae
+    save_checkpoint_atomic(build_state(), checkpoint_dir / f"seed{seed}_latest.pt")
+    with open(history_path, "w") as fh:
+        json.dump(history, fh)
 
-# Token-count sweep checkpoints
-CHECKPOINT_TOKENS = [1_000_000, 50_000_000, 100_000_000]
-CHECKPOINT_DIR = "outputs/checkpoints"
+    return sae, history
 
-# Set to e.g. "username/sae-stability-checkpoints" to push each checkpoint to
-# Hugging Face Hub as it's saved (requires `huggingface-cli login` to have been run
-# in a terminal first). Set to None to skip remote backup and only save locally.
-HF_REPO_ID = "ndasari/SAE_project"
 
 trained_saes = {}
+training_histories = {}
 for seed in CONFIG["seeds"]:
     print(f"=== Training seed {seed} ===")
     stream = activation_stream_generator(
@@ -265,7 +421,7 @@ for seed in CONFIG["seeds"]:
         batch_size=CONFIG["batch_size"],
         device=CONFIG["device"],
     )
-    trained_saes[seed] = train_sae_single_seed(
+    trained_saes[seed], training_histories[seed] = train_sae_single_seed(
         seed=seed,
         activation_stream=stream,
         config=CONFIG,
@@ -276,6 +432,84 @@ for seed in CONFIG["seeds"]:
 
 print(f"\nTrained {len(trained_saes)} SAEs with seeds: {list(trained_saes.keys())}")
 print(f"Checkpoints saved at token counts: {CHECKPOINT_TOKENS}")
+
+"""### 3b. Training curves — is l1_coeff too large?
+
+`l1_coeff` is 1.0 here, three orders of magnitude above the 1e-3 used for the earlier
+1M/10M runs, so these curves are the check on whether the sparsity penalty is dominating.
+The warning signs, in order of how conclusive they are: the dead-feature fraction climbing
+toward 100%, L0 collapsing toward 0, and the weighted L1 term sitting far above the
+reconstruction term. Any of those means most features are being pushed to zero and the SAE
+is buying sparsity at the cost of reconstructing anything.
+"""
+
+
+def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_path=None):
+    """Plot the diagnostics that reveal a too-strong sparsity penalty."""
+    histories = {s: h for s, h in histories.items() if h and h["tokens_seen"]}
+    if not histories:
+        print("No training history recorded yet (fewer than LOG_EVERY_STEPS steps run).")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+
+    for seed, h in histories.items():
+        axes[0, 0].plot(h["tokens_seen"], h["recon_loss"], label=f"seed {seed}")
+        axes[1, 0].plot(h["tokens_seen"], h["l0"], label=f"seed {seed}")
+        axes[1, 1].plot(h["tokens_seen"], [100 * d for d in h["dead_frac"]], label=f"seed {seed}")
+
+    axes[0, 0].set_ylabel("Reconstruction loss (MSE)")
+    axes[0, 0].set_title("Reconstruction loss")
+
+    # Compare the two loss terms directly, on one seed, to see which dominates.
+    anchor_seed = list(histories.keys())[0]
+    h = histories[anchor_seed]
+    axes[0, 1].plot(h["tokens_seen"], h["recon_loss"], label="reconstruction")
+    axes[0, 1].plot(h["tokens_seen"], h["l1_term"], label=f"l1_coeff x L1 ({config['l1_coeff']:g})")
+    axes[0, 1].set_yscale("log")
+    axes[0, 1].set_ylabel("Loss term")
+    axes[0, 1].set_title(f"Loss terms compared (seed {anchor_seed})")
+
+    axes[1, 0].set_ylabel("L0 (mean active features/token)")
+    axes[1, 0].set_title("Sparsity: L0 -> 0 means over-penalized")
+
+    axes[1, 1].set_ylabel("Dead features (%)")
+    axes[1, 1].set_ylim(0, 100)
+    axes[1, 1].set_title("Dead features per logging window")
+
+    for ax in axes.flat:
+        ax.set_xlabel("Tokens seen")
+        ax.legend(fontsize=8)
+
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=150)
+        print(f"Saved training curves to {save_path}")
+    plt.show()
+
+    print(f"\n=== l1_coeff = {config['l1_coeff']:g} diagnostic (final logging window) ===")
+    for seed, h in histories.items():
+        ratio = h["l1_term"][-1] / h["recon_loss"][-1] if h["recon_loss"][-1] > 0 else float("inf")
+        print(f"  seed {seed}: L0={h['l0'][-1]:.1f}, dead={100 * h['dead_frac'][-1]:.1f}%, "
+              f"l1_term/recon={ratio:.2f}")
+
+    worst_dead = max(100 * h["dead_frac"][-1] for h in histories.values())
+    lowest_l0 = min(h["l0"][-1] for h in histories.values())
+    if worst_dead > 90 or lowest_l0 < 1:
+        print(f"\n  WARNING: up to {worst_dead:.1f}% of features dead and L0 as low as "
+              f"{lowest_l0:.2f}. l1_coeff={config['l1_coeff']:g} looks too large -- the SAE is "
+              f"collapsing to the trivial all-zero solution. Consider 1e-3 (the value used "
+              f"for the 1M/10M runs).")
+    else:
+        print(f"\n  L0 and dead-feature fraction look non-degenerate at "
+              f"l1_coeff={config['l1_coeff']:g}.")
+
+
+plot_training_curves(
+    training_histories,
+    CONFIG,
+    save_path=OUTPUT_DIR / "training_curves.png",
+)
 
 """## 4. Feature Matching Between SAEs (decoder-only, Gerasimov et al. Section 4)
 
@@ -450,30 +684,29 @@ print(feature_df[feature_df["is_unstable"]].head(10))
 
 """## 7. Save Results (Optional)"""
 
-# Save results for future use
-import os
-
-# Create output directory
-os.makedirs("outputs", exist_ok=True)
-
 # Save feature stability data
-feature_df.to_csv("outputs/feature_stability.csv", index=False)
-print("Saved feature stability data to outputs/feature_stability.csv")
+feature_df.to_csv(OUTPUT_DIR / "feature_stability.csv", index=False)
+print(f"Saved feature stability data to {OUTPUT_DIR / 'feature_stability.csv'}")
 
 # Save SAE checkpoints
 for seed, sae in trained_saes.items():
-    torch.save(sae.state_dict(), f"outputs/sae_seed_{seed}.pt")
-    print(f"Saved SAE checkpoint to outputs/sae_seed_{seed}.pt")
+    torch.save(sae.state_dict(), OUTPUT_DIR / f"sae_seed_{seed}.pt")
+    print(f"Saved SAE checkpoint to {OUTPUT_DIR / f'sae_seed_{seed}.pt'}")
 
 # Save matching info
 np.savez(
-    "outputs/matching_info.npz",
+    OUTPUT_DIR / "matching_info.npz",
     similarities=np.array(matching_info["similarities"]),
     reappearance_probs=reappearance_probs,
     stable_indices=stable_indices,
     unstable_indices=unstable_indices,
 )
-print("Saved matching info to outputs/matching_info.npz")
+print(f"Saved matching info to {OUTPUT_DIR / 'matching_info.npz'}")
+
+# Save the run config so a resumed/re-analyzed run is self-describing
+with open(OUTPUT_DIR / "config.json", "w") as fh:
+    json.dump({**CONFIG, "checkpoint_tokens": CHECKPOINT_TOKENS}, fh, indent=2)
+print(f"Saved run config to {OUTPUT_DIR / 'config.json'}")
 
 """## 8. Analyze Stable Features"""
 

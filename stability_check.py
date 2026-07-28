@@ -9,6 +9,7 @@ piece the main training script does not do on its own: it only ever analyzes the
 last checkpoint (the final trained_saes dict), never compares across checkpoints.
 """
 
+import os
 import re
 import numpy as np
 import torch
@@ -17,7 +18,29 @@ import torch.nn.functional as F
 from pathlib import Path
 from typing import Dict, Tuple
 
-CHECKPOINT_DIR = "outputs/checkpoints"
+# Must match RUN_NAME / CHECKPOINT_DIR in prelim_experiments_update.py, which writes to
+# Drive on Colab so checkpoints survive a runtime disconnect.
+MODEL_NAME = "pythia-70m-deduped"
+LAYER = 3
+TOKEN_BUDGET_B = 8  # max(CHECKPOINT_TOKENS) in billions, used only to build RUN_NAME
+
+if os.environ.get("SAE_RESULTS_BASE"):
+    RESULTS_BASE = os.environ["SAE_RESULTS_BASE"]
+elif Path("/content/drive/MyDrive").exists():
+    RESULTS_BASE = "/content/drive/MyDrive/sae-stability-outputs"
+else:
+    try:
+        from google.colab import drive
+
+        drive.mount("/content/drive")
+        RESULTS_BASE = "/content/drive/MyDrive/sae-stability-outputs"
+    except (ImportError, ModuleNotFoundError):
+        RESULTS_BASE = "outputs"
+
+RUN_NAME = f"{MODEL_NAME}_L{LAYER}_{TOKEN_BUDGET_B}Btok"
+OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
+CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
+
 SEEDS = [42, 137, 256, 512, 1024]
 THETA = 0.7      # Gerasimov et al. decoder-only matching threshold
 EPSILON = 0.05   # endpoint binarization
@@ -89,7 +112,7 @@ def load_saes_at_token_count(checkpoint_dir: str, seeds: list, token_count: int)
     saes = {}
     for seed in seeds:
         path = Path(checkpoint_dir) / f"seed{seed}_tokens{token_count}.pt"
-        ckpt = torch.load(path, map_location="cpu")
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
         cfg = ckpt["config"]
         sae = SparseAutoencoder(cfg["d_model"], cfg["n_features"], seed=seed)
         sae.load_state_dict(ckpt["model_state_dict"])
@@ -141,14 +164,14 @@ def main():
         print(f"{r['token_count']:>15,} {r['mean_p_hat']:>12.4f} {r['pct_stable']:>9.1f}% {100 * r['unstable'] / r['n_features']:>11.1f}%")
 
     # Save results for later use (e.g. plotting, or feeding into the classifier notebook)
-    Path("outputs").mkdir(exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     np.savez(
-        "outputs/stability_by_token_count.npz",
+        OUTPUT_DIR / "stability_by_token_count.npz",
         token_counts=np.array([r["token_count"] for r in results]),
         mean_p_hat=np.array([r["mean_p_hat"] for r in results]),
         pct_stable=np.array([r["pct_stable"] for r in results]),
     )
-    print("\nSaved summary to outputs/stability_by_token_count.npz")
+    print(f"\nSaved summary to {OUTPUT_DIR / 'stability_by_token_count.npz'}")
 
     # Try to plot, if matplotlib is available and there's a display backend
     try:
@@ -174,8 +197,8 @@ def main():
         axes[1].set_title("Mean p_hat vs. training scale")
 
         plt.tight_layout()
-        plt.savefig("outputs/stability_by_token_count.png", dpi=150)
-        print("Saved plot to outputs/stability_by_token_count.png")
+        plt.savefig(OUTPUT_DIR / "stability_by_token_count.png", dpi=150)
+        print(f"Saved plot to {OUTPUT_DIR / 'stability_by_token_count.png'}")
     except Exception as e:
         print(f"(Skipped plotting: {e})")
 
