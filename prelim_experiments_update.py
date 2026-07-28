@@ -88,11 +88,37 @@ print(f"Results will be saved to: {OUTPUT_DIR}")
 
 """## 1. Load Model and Set Up Activation Streaming"""
 
-# Load the Pythia model
-model = HookedTransformer.from_pretrained(
-    CONFIG["model_name"],
-    device=CONFIG["device"],
-)
+def load_pythia(model_name: str, device: str) -> HookedTransformer:
+    """Load a Pythia (GPT-NeoX) model into transformer_lens.
+
+    transformer_lens's NeoX weight converter reads `hf_model.embed_out`, but recent
+    transformers renamed that head to `lm_head`, so letting transformer_lens load the model
+    itself dies with "'GPTNeoXForCausalLM' object has no attribute 'embed_out'". Loading the
+    HF model here and aliasing the name the converter expects onto the actual output head
+    works on either version and leaves the weights untouched.
+    """
+    from transformers import AutoModelForCausalLM
+    from transformer_lens.loading_from_pretrained import get_official_model_name
+
+    official_name = get_official_model_name(model_name)
+    try:
+        hf_model = AutoModelForCausalLM.from_pretrained(official_name, dtype=torch.float32)
+    except TypeError:  # transformers < 4.56 spells this torch_dtype
+        hf_model = AutoModelForCausalLM.from_pretrained(official_name, torch_dtype=torch.float32)
+
+    if not hasattr(hf_model, "embed_out"):
+        head = hf_model.get_output_embeddings()
+        if head is None:
+            raise RuntimeError(
+                f"{official_name} exposes neither embed_out nor get_output_embeddings(); "
+                f"cannot build the state dict transformer_lens expects."
+            )
+        hf_model.embed_out = head
+
+    return HookedTransformer.from_pretrained(model_name, hf_model=hf_model, device=device)
+
+
+model = load_pythia(CONFIG["model_name"], CONFIG["device"])
 model.eval()
 print(f"Loaded {CONFIG['model_name']} with {model.cfg.n_layers} layers")
 
