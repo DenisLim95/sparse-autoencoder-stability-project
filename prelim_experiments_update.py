@@ -9,7 +9,9 @@ SAE stability project — preliminary experiments.
 
 import json
 import os
+import queue
 import re
+import threading
 import time
 import numpy as np
 import torch
@@ -52,6 +54,10 @@ CHECKPOINT_EVERY_SECONDS = 900
 
 # How often (in optimizer steps) to record a point on the training curves.
 LOG_EVERY_STEPS = 200
+
+# Batches buffered ahead by the producer thread. Each holds batch_size * seq_len * d_model
+# floats (~64 MB at the current settings), so keep this small.
+PREFETCH_BATCHES = 4
 
 # --- Persistent output directory ---------------------------------------------
 # An 8B-token run will outlive the session that started it, so results must land
@@ -254,36 +260,79 @@ def save_checkpoint_atomic(state: dict, path: Path):
     os.replace(tmp, path)
 
 
-def load_resume_state(checkpoint_dir: Path, seed: int):
-    """Return whichever checkpoint for this seed is furthest along: the rolling `_latest`
-    file or the newest milestone. Milestones are sorted by their ACTUAL token count, not
-    alphabetically -- "...tokens5000000000.pt" would otherwise sort after
-    "...tokens1000000000.pt" since '5' > '1', even though 5B > 1B."""
-    candidates = [checkpoint_dir / f"seed{seed}_latest.pt"]
-    candidates += sorted(
-        checkpoint_dir.glob(f"seed{seed}_tokens*.pt"),
-        key=lambda p: int(re.search(r"tokens(\d+)\.pt", p.name).group(1)),
-    )[-1:]
+def prefetch_batches(iterable, max_queued: int = 4):
+    """Produce batches on a background thread so activation generation overlaps SAE
+    training instead of alternating with it.
 
-    best = None
-    for path in candidates:
-        if not path.exists():
-            continue
+    Building a batch is mostly tokenization (Rust, releases the GIL) plus a Pythia forward
+    (CUDA, releases the GIL), so a plain thread genuinely overlaps with the training step
+    rather than fighting it for the interpreter.
+    """
+    q: queue.Queue = queue.Queue(maxsize=max_queued)
+    done = object()
+
+    def produce():
+        try:
+            for item in iterable:
+                q.put(item)
+        except Exception as e:  # surface it on the consumer side instead of dying silently
+            q.put(e)
+        finally:
+            q.put(done)
+
+    threading.Thread(target=produce, daemon=True).start()
+
+    while True:
+        item = q.get()
+        if item is done:
+            return
+        if isinstance(item, Exception):
+            raise item
+        yield item
+
+
+def load_shared_resume_state(checkpoint_dir: Path, seeds: list, checkpoint_tokens: list):
+    """Find the furthest point all seeds can resume from together.
+
+    Seeds advance in lockstep, so they share one rolling checkpoint. If that file is missing
+    or unreadable, fall back to the largest milestone every seed reached, which costs one
+    milestone interval rather than the whole run.
+    """
+    shared_path = checkpoint_dir / "shared_latest.pt"
+    if shared_path.exists():
         try:
             # Explicit weights_only=False: these are our own checkpoints and they carry
             # optimizer/config/history alongside the weights. Newer torch flips the default
             # to True, which would break resume part-way through a multi-day run.
-            ckpt = torch.load(path, map_location="cpu", weights_only=False)
+            return torch.load(shared_path, map_location="cpu", weights_only=False)
         except Exception as e:
-            print(f"[seed {seed}] ignoring unreadable checkpoint {path.name}: {e}")
+            print(f"Ignoring unreadable rolling checkpoint {shared_path.name}: {e}")
+
+    for milestone in sorted(checkpoint_tokens, reverse=True):
+        paths = {s: checkpoint_dir / f"seed{s}_tokens{milestone}.pt" for s in seeds}
+        if not all(p.exists() for p in paths.values()):
             continue
-        if best is None or ckpt["tokens_seen"] > best["tokens_seen"]:
-            best = ckpt
-    return best
+        try:
+            ckpts = {
+                s: torch.load(p, map_location="cpu", weights_only=False)
+                for s, p in paths.items()
+            }
+        except Exception as e:
+            print(f"Ignoring unreadable milestone {milestone:,}: {e}")
+            continue
+        print(f"No rolling checkpoint; falling back to the {milestone:,}-token milestone.")
+        return {
+            "tokens_seen": min(c["tokens_seen"] for c in ckpts.values()),
+            "step": min(c.get("step", 0) for c in ckpts.values()),
+            "models": {s: c["model_state_dict"] for s, c in ckpts.items()},
+            "optimizers": {s: c["optimizer_state_dict"] for s, c in ckpts.items()},
+            "histories": {s: c.get("history", empty_history()) for s, c in ckpts.items()},
+        }
+    return None
 
 
-def train_sae_single_seed(
-    seed,
+def train_saes_shared_stream(
+    seeds,
     activation_stream,
     config,
     checkpoint_tokens,
@@ -292,169 +341,212 @@ def train_sae_single_seed(
     checkpoint_every_seconds=CHECKPOINT_EVERY_SECONDS,
     log_every_steps=LOG_EVERY_STEPS,
 ):
-    """Train one SAE for a given seed, saving a milestone checkpoint at each token count in
-    checkpoint_tokens plus a rolling `_latest` checkpoint every checkpoint_every_seconds.
-    Resumes from whichever of the two is furthest along. If hf_repo_id is given, milestone
-    checkpoints are also pushed to that Hugging Face model repo.
+    """Train one SAE per seed on a single shared pass over the activations.
 
-    Returns (sae, history), where history holds the training curves.
+    Every seed reads the same data in the same order by design -- only initialization is
+    meant to differ -- so training them one after another regenerated identical activations
+    once per seed. Producing each batch once and updating all seeds from it does the same
+    arithmetic for ~1/5th of the data-pipeline work, and makes the seeds see identical data
+    by construction even across restarts.
+
+    Milestone checkpoints are written per seed in the same format as before, so
+    stability_check.py needs no changes. The rolling checkpoint is shared, since the seeds
+    advance together.
+
+    Returns (saes, histories), both keyed by seed.
     """
     device = config["device"]
     checkpoint_dir = Path(checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-
-    sae = SparseAutoencoder(config["d_model"], config["n_features"], seed=seed).to(device)
-    optimizer = torch.optim.Adam(sae.parameters(), lr=config["lr"])
-
     checkpoint_tokens = sorted(checkpoint_tokens)
+
+    # Each __init__ reseeds the RNG before drawing, so construction order doesn't matter.
+    saes = {
+        s: SparseAutoencoder(config["d_model"], config["n_features"], seed=s).to(device)
+        for s in seeds
+    }
+    optimizers = {s: torch.optim.Adam(saes[s].parameters(), lr=config["lr"]) for s in seeds}
+    histories = {s: empty_history() for s in seeds}
     tokens_seen = 0
     step = 0
-    history = empty_history()
 
     if hf_repo_id is not None:
         from huggingface_hub import HfApi
         hf_api = HfApi()
 
-    resume = load_resume_state(checkpoint_dir, seed)
+    resume = load_shared_resume_state(checkpoint_dir, seeds, checkpoint_tokens)
     if resume is not None:
-        sae.load_state_dict(resume["model_state_dict"])
-        optimizer.load_state_dict(resume["optimizer_state_dict"])
+        for s in seeds:
+            saes[s].load_state_dict(resume["models"][s])
+            optimizers[s].load_state_dict(resume["optimizers"][s])
+            histories[s] = resume["histories"].get(s, empty_history())
         tokens_seen = resume["tokens_seen"]
         step = resume.get("step", 0)
-        history = resume.get("history", empty_history())
-        print(f"[seed {seed}] resumed at {tokens_seen:,} tokens")
-        print(f"[seed {seed}] CAVEAT: the activation stream restarts from the beginning of "
-              f"the dataset, so tokens already trained on will be seen again. The token "
-              f"counts below therefore measure optimization steps, not unique tokens.")
+        print(f"Resumed all {len(seeds)} seeds at {tokens_seen:,} tokens")
+        print("CAVEAT: the activation stream restarts from the beginning of the dataset, so "
+              "tokens already trained on will be seen again. Past the first restart the "
+              "token counts measure optimization, not unique tokens. All seeds replay the "
+              "same data, so cross-seed comparisons stay valid.")
 
     next_checkpoint_idx = sum(t <= tokens_seen for t in checkpoint_tokens)
     if next_checkpoint_idx >= len(checkpoint_tokens):
-        print(f"[seed {seed}] already at {tokens_seen:,} tokens; nothing left to train.")
-        return sae, history
+        print(f"Already at {tokens_seen:,} tokens; nothing left to train.")
+        return saes, histories
 
-    history_path = checkpoint_dir.parent / f"training_history_seed{seed}.json"
     # Accumulate curve metrics as on-device tensors and only pull them to the host at
-    # logging time; calling .item() every step would force a GPU sync 244k times per seed.
-    interval_sums = torch.zeros(4, device=device)  # recon, sparsity, total, l0
+    # logging time; calling .item() every step would force a GPU sync 244k times.
+    interval_sums = {s: torch.zeros(4, device=device) for s in seeds}  # recon, sparsity, total, l0
     interval_n = 0
-    seen_active = torch.zeros(config["n_features"], dtype=torch.bool, device=device)
+    seen_active = {
+        s: torch.zeros(config["n_features"], dtype=torch.bool, device=device) for s in seeds
+    }
     last_checkpoint_time = time.time()
 
-    def build_state():
+    def build_seed_state(seed):
         return {
-            "model_state_dict": sae.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
+            "model_state_dict": saes[seed].state_dict(),
+            "optimizer_state_dict": optimizers[seed].state_dict(),
             "tokens_seen": tokens_seen,
             "step": step,
             "seed": seed,
             "config": config,
-            "history": history,
+            "history": histories[seed],
         }
 
-    for batch in activation_stream:
-        batch = batch.to(device)
-        x_hat, f, loss_dict = sae(batch)
-        loss = loss_dict["recon_loss"] + config["l1_coeff"] * loss_dict["sparsity_loss"]
+    def build_shared_state():
+        return {
+            "tokens_seen": tokens_seen,
+            "step": step,
+            "config": config,
+            "models": {s: saes[s].state_dict() for s in seeds},
+            "optimizers": {s: optimizers[s].state_dict() for s in seeds},
+            "histories": histories,
+        }
 
-        optimizer.zero_grad()
-        loss.backward()
-        with torch.no_grad():
-            sae.W_dec.grad = remove_parallel_component(sae.W_dec.data, sae.W_dec.grad)
-        optimizer.step()
-        sae.normalize_decoder()
+    def write_histories():
+        for s in seeds:
+            with open(checkpoint_dir.parent / f"training_history_seed{s}.json", "w") as fh:
+                json.dump(histories[s], fh)
+
+    for batch in activation_stream:
+        batch = batch.to(device, non_blocking=True)
+
+        for s in seeds:
+            sae, optimizer = saes[s], optimizers[s]
+            x_hat, f, loss_dict = sae(batch)
+            loss = loss_dict["recon_loss"] + config["l1_coeff"] * loss_dict["sparsity_loss"]
+
+            optimizer.zero_grad()
+            loss.backward()
+            with torch.no_grad():
+                sae.W_dec.grad = remove_parallel_component(sae.W_dec.data, sae.W_dec.grad)
+            optimizer.step()
+            sae.normalize_decoder()
+
+            with torch.no_grad():
+                active = f > 0
+                interval_sums[s][0] += loss_dict["recon_loss"].detach()
+                interval_sums[s][1] += loss_dict["sparsity_loss"].detach()
+                interval_sums[s][2] += loss.detach()
+                interval_sums[s][3] += active.float().sum(dim=1).mean()
+                seen_active[s] |= active.any(dim=0)
 
         # batch is already the flattened (batch_size * seq_len, d_model) activations
         # from activation_stream_generator -- batch.shape[0] IS the real token count
-        # for this step. Do NOT multiply by seq_len again (that was double-counting).
+        # for this step. Every seed consumed this same batch, so count it once.
         tokens_seen += batch.shape[0]
         step += 1
-
-        with torch.no_grad():
-            active = f > 0
-            interval_sums[0] += loss_dict["recon_loss"].detach()
-            interval_sums[1] += loss_dict["sparsity_loss"].detach()
-            interval_sums[2] += loss.detach()
-            interval_sums[3] += active.float().sum(dim=1).mean()
-            interval_n += 1
-            seen_active |= active.any(dim=0)
+        interval_n += 1
 
         if step % log_every_steps == 0:
-            recon, sparsity, total, l0 = (interval_sums / interval_n).tolist()
-            history["step"].append(step)
-            history["tokens_seen"].append(tokens_seen)
-            history["recon_loss"].append(recon)
-            history["sparsity_loss"].append(sparsity)
-            history["l1_term"].append(config["l1_coeff"] * sparsity)
-            history["total_loss"].append(total)
-            history["l0"].append(l0)
-            # Dead = never fired anywhere in this logging window.
-            history["dead_frac"].append(1.0 - seen_active.float().mean().item())
-            print(f"[seed {seed}] step {step:>7} | {tokens_seen:>14,} tok | "
-                  f"recon {recon:.5f} | l1_term {config['l1_coeff'] * sparsity:.5f} | "
-                  f"L0 {l0:6.1f} | dead {100 * history['dead_frac'][-1]:5.1f}%")
-            interval_sums.zero_()
+            l0s, recons = [], []
+            for s in seeds:
+                recon, sparsity, total, l0 = (interval_sums[s] / interval_n).tolist()
+                dead_frac = 1.0 - seen_active[s].float().mean().item()
+                h = histories[s]
+                h["step"].append(step)
+                h["tokens_seen"].append(tokens_seen)
+                h["recon_loss"].append(recon)
+                h["sparsity_loss"].append(sparsity)
+                h["l1_term"].append(config["l1_coeff"] * sparsity)
+                h["total_loss"].append(total)
+                h["l0"].append(l0)
+                # Dead = never fired anywhere in this logging window.
+                h["dead_frac"].append(dead_frac)
+                l0s.append(l0)
+                recons.append(recon)
+                interval_sums[s].zero_()
+                seen_active[s] = torch.zeros(
+                    config["n_features"], dtype=torch.bool, device=device
+                )
             interval_n = 0
-            seen_active = torch.zeros(config["n_features"], dtype=torch.bool, device=device)
+            worst_dead = max(100 * histories[s]["dead_frac"][-1] for s in seeds)
+            mean_sparsity = np.mean([histories[s]["sparsity_loss"][-1] for s in seeds])
+            print(f"step {step:>7} | {tokens_seen:>14,} tok | "
+                  f"recon {np.mean(recons):.5f} | "
+                  f"l1_term {config['l1_coeff'] * mean_sparsity:.5f} | "
+                  f"L0 {np.mean(l0s):6.1f} ({min(l0s):.0f}-{max(l0s):.0f}) | "
+                  f"dead {worst_dead:5.1f}%")
 
         if time.time() - last_checkpoint_time >= checkpoint_every_seconds:
-            save_checkpoint_atomic(build_state(), checkpoint_dir / f"seed{seed}_latest.pt")
-            with open(history_path, "w") as fh:
-                json.dump(history, fh)
+            save_checkpoint_atomic(build_shared_state(), checkpoint_dir / "shared_latest.pt")
+            write_histories()
             last_checkpoint_time = time.time()
-            print(f"[seed {seed}] rolling checkpoint at {tokens_seen:,} tokens")
+            print(f"rolling checkpoint at {tokens_seen:,} tokens")
 
         if next_checkpoint_idx < len(checkpoint_tokens) and tokens_seen >= checkpoint_tokens[next_checkpoint_idx]:
-            ckpt_name = f"seed{seed}_tokens{checkpoint_tokens[next_checkpoint_idx]}.pt"
-            ckpt_path = checkpoint_dir / ckpt_name
-            save_checkpoint_atomic(build_state(), ckpt_path)
-            print(f"[seed {seed}] milestone checkpoint saved at {tokens_seen:,} tokens")
+            milestone = checkpoint_tokens[next_checkpoint_idx]
+            for s in seeds:
+                ckpt_name = f"seed{s}_tokens{milestone}.pt"
+                ckpt_path = checkpoint_dir / ckpt_name
+                save_checkpoint_atomic(build_seed_state(s), ckpt_path)
 
-            if hf_repo_id is not None:
-                try:
-                    hf_api.upload_file(
-                        path_or_fileobj=str(ckpt_path),
-                        path_in_repo=f"checkpoints/{ckpt_name}",
-                        repo_id=hf_repo_id,
-                        repo_type="model",
-                    )
-                    print(f"[seed {seed}] checkpoint pushed to hf.co/{hf_repo_id}/checkpoints/{ckpt_name}")
-                except Exception as e:
-                    # Don't let an upload failure kill the training run -- local
-                    # checkpoint already saved above, so we can retry the push later.
-                    print(f"[seed {seed}] WARNING: HF upload failed ({e}); local checkpoint is still safe.")
+                if hf_repo_id is not None:
+                    try:
+                        hf_api.upload_file(
+                            path_or_fileobj=str(ckpt_path),
+                            path_in_repo=f"checkpoints/{ckpt_name}",
+                            repo_id=hf_repo_id,
+                            repo_type="model",
+                        )
+                    except Exception as e:
+                        # Don't let an upload failure kill the training run -- the local
+                        # checkpoint is already saved, so the push can be retried later.
+                        print(f"WARNING: HF upload of {ckpt_name} failed ({e}); "
+                              f"local checkpoint is still safe.")
 
+            print(f"milestone reached: all {len(seeds)} seeds checkpointed at "
+                  f"{milestone:,} tokens -- runnable through stability_check.py now")
+            save_checkpoint_atomic(build_shared_state(), checkpoint_dir / "shared_latest.pt")
+            write_histories()
             next_checkpoint_idx += 1
 
         if next_checkpoint_idx >= len(checkpoint_tokens):
             break
 
-    save_checkpoint_atomic(build_state(), checkpoint_dir / f"seed{seed}_latest.pt")
-    with open(history_path, "w") as fh:
-        json.dump(history, fh)
+    save_checkpoint_atomic(build_shared_state(), checkpoint_dir / "shared_latest.pt")
+    write_histories()
 
-    return sae, history
+    return saes, histories
 
 
-trained_saes = {}
-training_histories = {}
-for seed in CONFIG["seeds"]:
-    print(f"=== Training seed {seed} ===")
-    stream = activation_stream_generator(
-        model=model,
-        dataset_name="monology/pile-uncopyrighted",
-        hook_point=CONFIG["hook_point"],
-        seq_len=CONFIG["seq_len"],
-        batch_size=CONFIG["batch_size"],
-        device=CONFIG["device"],
-    )
-    trained_saes[seed], training_histories[seed] = train_sae_single_seed(
-        seed=seed,
-        activation_stream=stream,
-        config=CONFIG,
-        checkpoint_tokens=CHECKPOINT_TOKENS,
-        checkpoint_dir=CHECKPOINT_DIR,
-        hf_repo_id=HF_REPO_ID,
-    )
+print(f"=== Training {len(CONFIG['seeds'])} seeds on a shared activation stream ===")
+stream = activation_stream_generator(
+    model=model,
+    dataset_name="monology/pile-uncopyrighted",
+    hook_point=CONFIG["hook_point"],
+    seq_len=CONFIG["seq_len"],
+    batch_size=CONFIG["batch_size"],
+    device=CONFIG["device"],
+)
+trained_saes, training_histories = train_saes_shared_stream(
+    seeds=CONFIG["seeds"],
+    activation_stream=prefetch_batches(stream, max_queued=PREFETCH_BATCHES),
+    config=CONFIG,
+    checkpoint_tokens=CHECKPOINT_TOKENS,
+    checkpoint_dir=CHECKPOINT_DIR,
+    hf_repo_id=HF_REPO_ID,
+)
 
 print(f"\nTrained {len(trained_saes)} SAEs with seeds: {list(trained_saes.keys())}")
 print(f"Checkpoints saved at token counts: {CHECKPOINT_TOKENS}")
