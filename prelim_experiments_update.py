@@ -424,6 +424,10 @@ def train_saes_shared_stream(
     if hf_repo_id is not None:
         from huggingface_hub import HfApi
         hf_api = HfApi()
+        # upload_file does not create the repo, so without this every mirror would fail
+        # with a warning and the run would silently persist nothing off-box. Fail loudly
+        # here instead: if the mirror cannot work, better to know before training starts.
+        hf_api.create_repo(hf_repo_id, repo_type="model", private=True, exist_ok=True)
         restore_checkpoints_from_hub(hf_repo_id, checkpoint_dir)
 
     def mirror_to_hub(path: Path, path_in_repo: str):
