@@ -41,7 +41,9 @@ RUN_NAME = f"{MODEL_NAME}_L{LAYER}_{TOKEN_BUDGET_B}Btok"
 OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 
-SEEDS = [42, 137, 256, 512, 1024]
+# Must match CONFIG["seeds"] in prelim_experiments_update.py. Three, not five: the 1B
+# checkpoints this run resumes from only cover these seeds.
+SEEDS = [42, 256, 1024]
 THETA = 0.7      # Gerasimov et al. decoder-only matching threshold
 EPSILON = 0.05   # endpoint binarization
 

@@ -37,7 +37,12 @@ CONFIG = {
     "batch_size": 256,
     "n_tokens": 10_000_000,  # kept for reference but now set later on
     "seq_len": 128,
-    "seeds": [42, 137, 256, 512, 1024],  # Five different random seeds
+    # Seeds 137 and 512 are deliberately excluded: the 1B checkpoints we resume from only
+    # cover these three, and the shared stream is paced by its least-trained seed, so adding
+    # a seed that must start from zero would cost the full 8B of stream and forfeit the
+    # head start. Reappearance probability therefore has three levels (0, 0.5, 1.0) instead
+    # of five -- a coarser target, traded for reaching 5B and 8B at all.
+    "seeds": [42, 256, 1024],
     "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
 
@@ -48,12 +53,16 @@ print(f"Using device: {CONFIG['device']}")
 # deadline, each milestone is a complete, analyzable five-seed result banked early, so a
 # run cut short still yields a scaling curve instead of nothing.
 CHECKPOINT_TOKENS = [
-    500_000_000,
-    1_000_000_000,
+    1_000_000_000,  # resume point; supplied by SAE_SEED_REPO rather than trained here
     2_000_000_000,
+    3_000_000_000,
     5_000_000_000,
     8_000_000_000,
 ]
+
+# Read-only repo to seed checkpoints from, e.g. SAE_SEED_REPO=ndasari/SAE_project. Lets a run
+# start from a collaborator's completed milestones; never uploaded to, so their repo is safe.
+SEED_REPO_ID = os.environ.get("SAE_SEED_REPO") or None
 
 # Consecutive entries in CHECKPOINT_TOKENS are up to 4B tokens apart -- far more than a
 # single Colab session can cover. Without a rolling checkpoint in between, a disconnect
@@ -307,21 +316,26 @@ def prefetch_batches(iterable, max_queued: int = 4):
         yield item
 
 
-def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path):
+def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path, seeds=None):
     """Pull any milestone checkpoints already on the Hub into the local checkpoint dir.
 
     Leased GPU machines get replaced, and the replacement arrives with an empty disk. Since
     milestone checkpoints are enough to resume from (see load_shared_resume_state), fetching
     them here means a run continues on a new machine instead of restarting from zero.
+
+    Restricted to `seeds` when given, so seeding from a collaborator's repo doesn't drag down
+    checkpoints for seeds this run isn't training.
     """
     from huggingface_hub import HfApi, hf_hub_download
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    pattern = re.compile(r"checkpoints/seed(\d+)_tokens\d+\.pt")
     try:
-        remote = [
-            f for f in HfApi().list_repo_files(repo_id, repo_type="model")
-            if re.fullmatch(r"checkpoints/seed\d+_tokens\d+\.pt", f)
-        ]
+        remote = []
+        for f in HfApi().list_repo_files(repo_id, repo_type="model"):
+            m = pattern.fullmatch(f)
+            if m and (seeds is None or int(m.group(1)) in set(seeds)):
+                remote.append(f)
     except Exception as e:
         print(f"Could not list hf.co/{repo_id} ({e}); starting from local state only.")
         return
@@ -388,6 +402,7 @@ def train_saes_shared_stream(
     checkpoint_tokens,
     checkpoint_dir,
     hf_repo_id=None,
+    seed_repo_id=None,
     checkpoint_every_seconds=CHECKPOINT_EVERY_SECONDS,
     log_every_steps=LOG_EVERY_STEPS,
 ):
@@ -428,7 +443,12 @@ def train_saes_shared_stream(
         # with a warning and the run would silently persist nothing off-box. Fail loudly
         # here instead: if the mirror cannot work, better to know before training starts.
         hf_api.create_repo(hf_repo_id, repo_type="model", private=True, exist_ok=True)
-        restore_checkpoints_from_hub(hf_repo_id, checkpoint_dir)
+        restore_checkpoints_from_hub(hf_repo_id, checkpoint_dir, seeds)
+
+    # Second, so our own further-along checkpoints win: restore only fetches what is missing.
+    if seed_repo_id is not None:
+        print(f"Seeding from collaborator repo hf.co/{seed_repo_id} (read-only)")
+        restore_checkpoints_from_hub(seed_repo_id, checkpoint_dir, seeds)
 
     def mirror_to_hub(path: Path, path_in_repo: str):
         if hf_api is None:
@@ -609,6 +629,7 @@ trained_saes, training_histories = train_saes_shared_stream(
     checkpoint_tokens=CHECKPOINT_TOKENS,
     checkpoint_dir=CHECKPOINT_DIR,
     hf_repo_id=HF_REPO_ID,
+    seed_repo_id=SEED_REPO_ID,
 )
 
 print(f"\nTrained {len(trained_saes)} SAEs with seeds: {list(trained_saes.keys())}")
