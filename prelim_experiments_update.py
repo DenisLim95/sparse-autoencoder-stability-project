@@ -11,6 +11,7 @@ import json
 import os
 import queue
 import re
+import shutil
 import threading
 import time
 import numpy as np
@@ -43,8 +44,16 @@ CONFIG = {
 print(f"Using device: {CONFIG['device']}")
 
 # Token budgets at which an SAE checkpoint is saved, so stability can be compared
-# across training scale.
-CHECKPOINT_TOKENS = [1_000_000_000, 5_000_000_000, 8_000_000_000]
+# across training scale. Roughly geometric: on a leased machine that gets deleted on a
+# deadline, each milestone is a complete, analyzable five-seed result banked early, so a
+# run cut short still yields a scaling curve instead of nothing.
+CHECKPOINT_TOKENS = [
+    500_000_000,
+    1_000_000_000,
+    2_000_000_000,
+    5_000_000_000,
+    8_000_000_000,
+]
 
 # Consecutive entries in CHECKPOINT_TOKENS are up to 4B tokens apart -- far more than a
 # single Colab session can cover. Without a rolling checkpoint in between, a disconnect
@@ -85,10 +94,17 @@ OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Set to a Hub repo you have write access to in order to mirror checkpoints remotely.
-# Pointing this at someone else's repo is worse than leaving it None: the upload fails on
-# auth, the failure is only warned about, and training continues persisting nothing.
-HF_REPO_ID = None
+# Hub repo to mirror checkpoints to, e.g. SAE_HF_REPO=yourname/sae-stability. Set this
+# whenever the machine's disk is not durable -- leased GPU boxes are commonly on instance
+# storage that is destroyed on shutdown, so local checkpoints alone can vanish with the run.
+# Point it at a repo you can write to: someone else's fails on auth, and the failure is only
+# warned about, so training would continue persisting nothing.
+HF_REPO_ID = os.environ.get("SAE_HF_REPO") or None
+if HF_REPO_ID:
+    print(f"Mirroring milestone checkpoints to hf.co/{HF_REPO_ID}")
+else:
+    print("WARNING: SAE_HF_REPO is unset -- checkpoints will only exist on this machine's "
+          "disk. If that disk is not durable, an outage or shutdown loses the whole run.")
 
 print(f"Results will be saved to: {OUTPUT_DIR}")
 
@@ -291,6 +307,40 @@ def prefetch_batches(iterable, max_queued: int = 4):
         yield item
 
 
+def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path):
+    """Pull any milestone checkpoints already on the Hub into the local checkpoint dir.
+
+    Leased GPU machines get replaced, and the replacement arrives with an empty disk. Since
+    milestone checkpoints are enough to resume from (see load_shared_resume_state), fetching
+    them here means a run continues on a new machine instead of restarting from zero.
+    """
+    from huggingface_hub import HfApi, hf_hub_download
+
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        remote = [
+            f for f in HfApi().list_repo_files(repo_id, repo_type="model")
+            if re.fullmatch(r"checkpoints/seed\d+_tokens\d+\.pt", f)
+        ]
+    except Exception as e:
+        print(f"Could not list hf.co/{repo_id} ({e}); starting from local state only.")
+        return
+
+    missing = [f for f in remote if not (checkpoint_dir / Path(f).name).exists()]
+    if not missing:
+        print(f"No milestone checkpoints to restore from hf.co/{repo_id}.")
+        return
+
+    print(f"Restoring {len(missing)} checkpoint(s) from hf.co/{repo_id}...")
+    for f in missing:
+        try:
+            local = hf_hub_download(repo_id, f, repo_type="model")
+            shutil.copyfile(local, checkpoint_dir / Path(f).name)
+            print(f"  restored {Path(f).name}")
+        except Exception as e:
+            print(f"  WARNING: could not restore {f}: {e}")
+
+
 def load_shared_resume_state(checkpoint_dir: Path, seeds: list, checkpoint_tokens: list):
     """Find the furthest point all seeds can resume from together.
 
@@ -370,9 +420,26 @@ def train_saes_shared_stream(
     tokens_seen = 0
     step = 0
 
+    hf_api = None
     if hf_repo_id is not None:
         from huggingface_hub import HfApi
         hf_api = HfApi()
+        restore_checkpoints_from_hub(hf_repo_id, checkpoint_dir)
+
+    def mirror_to_hub(path: Path, path_in_repo: str):
+        if hf_api is None:
+            return
+        try:
+            hf_api.upload_file(
+                path_or_fileobj=str(path),
+                path_in_repo=path_in_repo,
+                repo_id=hf_repo_id,
+                repo_type="model",
+            )
+        except Exception as e:
+            # Don't let an upload failure kill the training run -- the local copy is
+            # already saved, so the push can be retried later.
+            print(f"WARNING: HF upload of {path.name} failed ({e}); local copy is safe.")
 
     resume = load_shared_resume_state(checkpoint_dir, seeds, checkpoint_tokens)
     if resume is not None:
@@ -500,25 +567,17 @@ def train_saes_shared_stream(
                 ckpt_name = f"seed{s}_tokens{milestone}.pt"
                 ckpt_path = checkpoint_dir / ckpt_name
                 save_checkpoint_atomic(build_seed_state(s), ckpt_path)
+                mirror_to_hub(ckpt_path, f"checkpoints/{ckpt_name}")
 
-                if hf_repo_id is not None:
-                    try:
-                        hf_api.upload_file(
-                            path_or_fileobj=str(ckpt_path),
-                            path_in_repo=f"checkpoints/{ckpt_name}",
-                            repo_id=hf_repo_id,
-                            repo_type="model",
-                        )
-                    except Exception as e:
-                        # Don't let an upload failure kill the training run -- the local
-                        # checkpoint is already saved, so the push can be retried later.
-                        print(f"WARNING: HF upload of {ckpt_name} failed ({e}); "
-                              f"local checkpoint is still safe.")
-
-            print(f"milestone reached: all {len(seeds)} seeds checkpointed at "
-                  f"{milestone:,} tokens -- runnable through stability_check.py now")
             save_checkpoint_atomic(build_shared_state(), checkpoint_dir / "shared_latest.pt")
             write_histories()
+            for s in seeds:
+                name = f"training_history_seed{s}.json"
+                mirror_to_hub(checkpoint_dir.parent / name, f"results/{name}")
+
+            print(f"milestone reached: all {len(seeds)} seeds checkpointed at "
+                  f"{milestone:,} tokens -- runnable through stability_check.py now"
+                  + (f", mirrored to hf.co/{hf_repo_id}" if hf_api is not None else ""))
             next_checkpoint_idx += 1
 
         if next_checkpoint_idx >= len(checkpoint_tokens):
