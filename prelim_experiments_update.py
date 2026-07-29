@@ -940,13 +940,31 @@ print(f"  Decoder norm:      mean={decoder_norms[unstable_indices].mean():.3f}, 
 print(f"  Activation freq:   mean={activation_freq[unstable_indices].mean():.4f}, std={activation_freq[unstable_indices].std():.4f}")
 print(f"  Mean activation:   mean={mean_activation[unstable_indices].mean():.4f}, std={mean_activation[unstable_indices].std():.4f}")
 
+def safe_hist(ax, values, bins, **kwargs):
+    """hist() that tolerates constant data.
+
+    normalize_decoder() pins every decoder norm to exactly 1.0, so the decoder-norm
+    histogram has zero range and matplotlib raises "Too many bins for data range".
+    That would abort the script after training has already finished, so degrade to a
+    single bin instead of losing the whole analysis to a plotting detail.
+    """
+    values = np.asarray(values)
+    if values.size == 0:
+        return
+    lo, hi = float(np.min(values)), float(np.max(values))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-12:
+        ax.hist(values, bins=1, range=(lo - 0.5, lo + 0.5), **kwargs)
+    else:
+        ax.hist(values, bins=bins, **kwargs)
+
+
 # Visualize: stable vs unstable feature properties
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
 # Plot 1: Decoder norms
 ax1 = axes[0]
-ax1.hist(decoder_norms[unstable_indices], bins=30, alpha=0.6, label="Unstable", color="#ff7f0e")
-ax1.hist(decoder_norms[stable_indices], bins=10, alpha=0.8, label="Stable", color="#2ca02c")
+safe_hist(ax1, decoder_norms[unstable_indices], 30, alpha=0.6, label="Unstable", color="#ff7f0e")
+safe_hist(ax1, decoder_norms[stable_indices], 10, alpha=0.8, label="Stable", color="#2ca02c")
 ax1.set_xlabel("Decoder Norm")
 ax1.set_ylabel("Count")
 ax1.set_title("Decoder Norms: Stable vs Unstable")
@@ -954,8 +972,8 @@ ax1.legend()
 
 # Plot 2: Activation frequency
 ax2 = axes[1]
-ax2.hist(activation_freq[unstable_indices], bins=30, alpha=0.6, label="Unstable", color="#ff7f0e")
-ax2.hist(activation_freq[stable_indices], bins=10, alpha=0.8, label="Stable", color="#2ca02c")
+safe_hist(ax2, activation_freq[unstable_indices], 30, alpha=0.6, label="Unstable", color="#ff7f0e")
+safe_hist(ax2, activation_freq[stable_indices], 10, alpha=0.8, label="Stable", color="#2ca02c")
 ax2.set_xlabel("Activation Frequency")
 ax2.set_ylabel("Count")
 ax2.set_title("Activation Frequency: Stable vs Unstable")
@@ -1268,8 +1286,8 @@ stats = [
 ]
 
 for ax, (name, values, description) in zip(axes.flat, stats):
-    ax.hist(values[unstable_indices], bins=30, alpha=0.6, label="Unstable", color="#ff7f0e", density=True)
-    ax.hist(values[stable_indices], bins=10, alpha=0.8, label="Stable", color="#2ca02c", density=True)
+    safe_hist(ax, values[unstable_indices], 30, alpha=0.6, label="Unstable", color="#ff7f0e", density=True)
+    safe_hist(ax, values[stable_indices], 10, alpha=0.8, label="Stable", color="#2ca02c", density=True)
     ax.set_xlabel(name)
     ax.set_ylabel("Density")
     ax.set_title(f"{name}\n({description})")
