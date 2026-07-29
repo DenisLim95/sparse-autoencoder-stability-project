@@ -37,16 +37,18 @@ CONFIG = {
     "batch_size": 256,
     "n_tokens": 10_000_000,  # kept for reference but now set later on
     "seq_len": 128,
-    # Seeds 137 and 512 are deliberately excluded: the 1B checkpoints we resume from only
-    # cover these three, and the shared stream is paced by its least-trained seed, so adding
-    # a seed that must start from zero would cost the full 8B of stream and forfeit the
-    # head start. Reappearance probability therefore has three levels (0, 0.5, 1.0) instead
-    # of five -- a coarser target, traded for reaching 5B and 8B at all.
-    "seeds": [42, 256, 1024],
+    # Defaults to the three seeds with 1B checkpoints to resume from. The shared stream is
+    # paced by its least-trained seed, so a seed starting from zero would forfeit that head
+    # start -- hence 137 and 512 are excluded here and are better trained as a separate
+    # process (SAE_SEEDS=137,512) on another GPU, where they cost this run nothing.
+    "seeds": [
+        int(s) for s in os.environ.get("SAE_SEEDS", "42,256,1024").split(",") if s.strip()
+    ],
     "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
 
 print(f"Using device: {CONFIG['device']}")
+print(f"Training seeds: {CONFIG['seeds']}")
 
 # Token budgets at which an SAE checkpoint is saved, so stability can be compared
 # across training scale. Roughly geometric: on a leased machine that gets deleted on a
@@ -316,6 +318,16 @@ def prefetch_batches(iterable, max_queued: int = 4):
         yield item
 
 
+def rolling_checkpoint_name(seeds) -> str:
+    """Name the shared rolling checkpoint after its seed set.
+
+    Two processes training different seed sets -- one resuming from 1B, another catching the
+    remaining seeds up on a second GPU -- can then share a checkpoint directory without
+    clobbering each other's rolling state. Milestone files are already per-seed.
+    """
+    return "shared_latest_seeds" + "-".join(str(s) for s in sorted(seeds)) + ".pt"
+
+
 def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path, seeds=None):
     """Pull any milestone checkpoints already on the Hub into the local checkpoint dir.
 
@@ -362,7 +374,10 @@ def load_shared_resume_state(checkpoint_dir: Path, seeds: list, checkpoint_token
     or unreadable, fall back to the largest milestone every seed reached, which costs one
     milestone interval rather than the whole run.
     """
-    shared_path = checkpoint_dir / "shared_latest.pt"
+    shared_path = checkpoint_dir / rolling_checkpoint_name(seeds)
+    legacy_path = checkpoint_dir / "shared_latest.pt"
+    if not shared_path.exists() and legacy_path.exists():
+        shared_path = legacy_path  # rolling checkpoint written before names were seed-scoped
     if shared_path.exists():
         try:
             # Explicit weights_only=False: these are our own checkpoints and they carry
@@ -580,7 +595,7 @@ def train_saes_shared_stream(
                   f"dead {worst_dead:5.1f}%")
 
         if time.time() - last_checkpoint_time >= checkpoint_every_seconds:
-            save_checkpoint_atomic(build_shared_state(), checkpoint_dir / "shared_latest.pt")
+            save_checkpoint_atomic(build_shared_state(), checkpoint_dir / rolling_checkpoint_name(seeds))
             write_histories()
             last_checkpoint_time = time.time()
             print(f"rolling checkpoint at {tokens_seen:,} tokens")
@@ -593,7 +608,7 @@ def train_saes_shared_stream(
                 save_checkpoint_atomic(build_seed_state(s), ckpt_path)
                 mirror_to_hub(ckpt_path, f"checkpoints/{ckpt_name}")
 
-            save_checkpoint_atomic(build_shared_state(), checkpoint_dir / "shared_latest.pt")
+            save_checkpoint_atomic(build_shared_state(), checkpoint_dir / rolling_checkpoint_name(seeds))
             write_histories()
             for s in seeds:
                 name = f"training_history_seed{s}.json"
@@ -607,7 +622,7 @@ def train_saes_shared_stream(
         if next_checkpoint_idx >= len(checkpoint_tokens):
             break
 
-    save_checkpoint_atomic(build_shared_state(), checkpoint_dir / "shared_latest.pt")
+    save_checkpoint_atomic(build_shared_state(), checkpoint_dir / rolling_checkpoint_name(seeds))
     write_histories()
 
     return saes, histories

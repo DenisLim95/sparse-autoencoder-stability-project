@@ -41,9 +41,12 @@ RUN_NAME = f"{MODEL_NAME}_L{LAYER}_{TOKEN_BUDGET_B}Btok"
 OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 
-# Must match CONFIG["seeds"] in prelim_experiments_update.py. Three, not five: the 1B
-# checkpoints this run resumes from only cover these seeds.
-SEEDS = [42, 256, 1024]
+# Must match CONFIG["seeds"] in prelim_experiments_update.py, and overridden the same way.
+# Set SAE_SEEDS=42,137,256,512,1024 to analyze all five once the catch-up seeds have
+# reached a milestone the original three also have.
+SEEDS = [
+    int(s) for s in os.environ.get("SAE_SEEDS", "42,256,1024").split(",") if s.strip()
+]
 THETA = 0.7      # Gerasimov et al. decoder-only matching threshold
 EPSILON = 0.05   # endpoint binarization
 
