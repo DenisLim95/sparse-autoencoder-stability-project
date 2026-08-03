@@ -32,17 +32,16 @@ CONFIG = {
     "hook_point": "blocks.3.hook_resid_post",  # Middle layer of Pythia-70m (6 layers, so layer 3)
     "d_model": 512,  # Pythia-70m hidden dimension
     "n_features": 2048,  # SAE dictionary size (4x expansion)
-    "l1_coeff": 1.0,  # Sparsity coefficient
+    "l1_coeff": 1e-3,  # Sparsity coefficient
     "lr": 1e-3,
     "batch_size": 256,
-    "n_tokens": 10_000_000,  # kept for reference but now set later on
     "seq_len": 128,
     # Defaults to the three seeds with 1B checkpoints to resume from. The shared stream is
     # paced by its least-trained seed, so a seed starting from zero would forfeit that head
     # start -- hence 137 and 512 are excluded here and are better trained as a separate
     # process (SAE_SEEDS=137,512) on another GPU, where they cost this run nothing.
     "seeds": [
-        int(s) for s in os.environ.get("SAE_SEEDS", "42,256,1024").split(",") if s.strip()
+        int(s) for s in os.environ.get("SAE_SEEDS", "42,137,256,512,1024").split(",") if s.strip()
     ],
     "device": "cuda" if torch.cuda.is_available() else "cpu",
 }
@@ -55,6 +54,9 @@ print(f"Training seeds: {CONFIG['seeds']}")
 # deadline, each milestone is a complete, analyzable five-seed result banked early, so a
 # run cut short still yields a scaling curve instead of nothing.
 CHECKPOINT_TOKENS = [
+    1_000_000,
+    50_000_000,
+    100_000_000,
     1_000_000_000,  # resume point; supplied by SAE_SEED_REPO rather than trained here
     2_000_000_000,
     3_000_000_000,
