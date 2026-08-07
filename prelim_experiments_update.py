@@ -32,14 +32,18 @@ CONFIG = {
     "hook_point": "blocks.3.hook_resid_post",  # Middle layer of Pythia-70m (6 layers, so layer 3)
     "d_model": 512,  # Pythia-70m hidden dimension
     "n_features": 2048,  # SAE dictionary size (4x expansion)
-    "l1_coeff": 1e-3,  # Sparsity coefficient
+    # Every checkpoint on both Hub repos (1M through 8B, all seeds) was trained at 1.0 --
+    # verified from each checkpoint's saved config and cross-checked against the recorded
+    # losses. Resuming those checkpoints under a different coefficient would change the
+    # objective mid-curve, so this must stay at 1.0 unless the whole sweep is retrained.
+    "l1_coeff": 1.0,  # Sparsity coefficient
     "lr": 1e-3,
     "batch_size": 256,
     "seq_len": 128,
-    # Defaults to the three seeds with 1B checkpoints to resume from. The shared stream is
-    # paced by its least-trained seed, so a seed starting from zero would forfeit that head
-    # start -- hence 137 and 512 are excluded here and are better trained as a separate
-    # process (SAE_SEEDS=137,512) on another GPU, where they cost this run nothing.
+    # Only 42, 256 and 1024 have checkpoints above 100M. The shared stream is paced by its
+    # least-trained seed, so including 137 or 512 here drags the whole run back to the 100M
+    # milestone they share -- set SAE_SEEDS=42,256,1024 to resume the 1B-8B curve, and train
+    # the catch-up seeds as a separate process (SAE_SEEDS=137,512) where they cost it nothing.
     "seeds": [
         int(s) for s in os.environ.get("SAE_SEEDS", "42,137,256,512,1024").split(",") if s.strip()
     ],
@@ -57,7 +61,9 @@ CHECKPOINT_TOKENS = [
     1_000_000,
     50_000_000,
     100_000_000,
-    1_000_000_000,  # resume point; supplied by SAE_SEED_REPO rather than trained here
+    # Resume point for seeds 42/256/1024 only, supplied by SAE_SEED_REPO. Seeds 137 and 512
+    # have nothing above 100M, so a run including them resumes from there instead.
+    1_000_000_000,
     2_000_000_000,
     3_000_000_000,
     5_000_000_000,
@@ -408,6 +414,7 @@ def load_shared_resume_state(checkpoint_dir: Path, seeds: list, checkpoint_token
             "models": {s: c["model_state_dict"] for s, c in ckpts.items()},
             "optimizers": {s: c["optimizer_state_dict"] for s, c in ckpts.items()},
             "histories": {s: c.get("history", empty_history()) for s, c in ckpts.items()},
+            "config": next(iter(ckpts.values())).get("config", {}),
         }
     return None
 
@@ -484,6 +491,17 @@ def train_saes_shared_stream(
 
     resume = load_shared_resume_state(checkpoint_dir, seeds, checkpoint_tokens)
     if resume is not None:
+        # Resuming under a different objective than the checkpoints were trained with would
+        # silently put a discontinuity in the middle of the scaling curve, and nothing
+        # downstream could detect it. Refuse rather than produce unattributable numbers.
+        prior_l1 = resume.get("config", {}).get("l1_coeff")
+        if prior_l1 is not None and prior_l1 != config["l1_coeff"]:
+            raise SystemExit(
+                f"Refusing to resume: checkpoints were trained with l1_coeff={prior_l1:g} but "
+                f"CONFIG has l1_coeff={config['l1_coeff']:g}. Continuing would change the "
+                f"objective mid-run. Set CONFIG['l1_coeff'] to {prior_l1:g}, or train from "
+                f"scratch into an empty checkpoint directory."
+            )
         for s in seeds:
             saes[s].load_state_dict(resume["models"][s])
             optimizers[s].load_state_dict(resume["optimizers"][s])
@@ -717,8 +735,9 @@ def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_pat
     if worst_dead > 90 or lowest_l0 < 1:
         print(f"\n  WARNING: up to {worst_dead:.1f}% of features dead and L0 as low as "
               f"{lowest_l0:.2f}. l1_coeff={config['l1_coeff']:g} looks too large -- the SAE is "
-              f"collapsing to the trivial all-zero solution. Consider 1e-3 (the value used "
-              f"for the 1M/10M runs).")
+              f"collapsing to the trivial all-zero solution. Lowering it is only valid for a "
+              f"sweep retrained from scratch; every existing checkpoint was trained at 1.0 and "
+              f"resuming one under a different coefficient is refused on purpose.")
     else:
         print(f"\n  L0 and dead-feature fraction look non-degenerate at "
               f"l1_coeff={config['l1_coeff']:g}.")
@@ -953,30 +972,62 @@ print(f"Eval activations shape: {activations.shape}")
 # batched accumulation, peak GPU usage ~32 MB
 STAT_BATCH = 4096  # reduce to 1024 if still OOM
 
-n_total = len(activations)
-freq_accum = torch.zeros(CONFIG["n_features"])
-mean_accum = torch.zeros(CONFIG["n_features"])
 
-with torch.no_grad():
-    for start in tqdm(range(0, n_total, STAT_BATCH), desc="Computing feature stats"):
-        batch = activations[start : start + STAT_BATCH].to(CONFIG["device"])
-        feats = reference_sae.encode(batch)               # (B, n_features)
-        freq_accum += (feats > 0).float().sum(dim=0).cpu()
-        mean_accum += feats.sum(dim=0).cpu()
+def compute_activation_stats(sae, activations, device, batch_size=STAT_BATCH, desc="feature stats"):
+    """Firing rate and firing strength for every feature of a single SAE.
 
-activation_freq = (freq_accum / n_total).numpy()
-mean_activation  = (mean_accum  / n_total).numpy()
+    Returns mean activation conditioned on the feature firing. The unconditional mean --
+    the sum of activations divided by ALL tokens -- is identically
+    (firing rate) x (conditional mean), so using it as a predictor alongside activation
+    frequency would double-count frequency rather than contribute anything new.
+    """
+    n_total = len(activations)
+    freq_accum = torch.zeros(sae.n_features)
+    sum_accum = torch.zeros(sae.n_features)
+
+    with torch.no_grad():
+        for start in tqdm(range(0, n_total, batch_size), desc=f"Computing {desc}"):
+            batch = activations[start : start + batch_size].to(device)
+            feats = sae.encode(batch)               # (B, n_features)
+            freq_accum += (feats > 0).float().sum(dim=0).cpu()
+            sum_accum += feats.sum(dim=0).cpu()
+
+    firing_counts = freq_accum.numpy()
+    activation_freq = firing_counts / max(n_total, 1)
+    mean_activation = np.divide(
+        sum_accum.numpy(), firing_counts,
+        out=np.zeros(sae.n_features), where=firing_counts > 0,
+    )
+    return activation_freq, mean_activation
+
+
+activation_freq, mean_activation = compute_activation_stats(
+    reference_sae, activations, CONFIG["device"], desc="reference-seed feature stats"
+)
+
+# Whether this eval set is large enough is decided by the rarest features, not the average
+# one. At L0 ~346/2048 the typical feature fires on ~17% of tokens and is pinned down to
+# several significant figures here; only a substantial low-count tail would justify the
+# streaming rewrite that reaching the intended 100M tokens requires (the eval set is
+# materialized as one tensor, so 100M tokens would be ~205 GB).
+_firing_counts = activation_freq * len(activations)
+print(f"\n=== Is {len(activations):,} eval tokens enough? (frequency estimate quality) ===")
+for _thresh in (10, 100, 1000):
+    _n = int((_firing_counts < _thresh).sum())
+    print(f"  features firing < {_thresh:5,} times: {_n:5d} "
+          f"({_n / len(activation_freq):5.1%}) -- relative error >~ {100 / max(_thresh, 1) ** 0.5:.0f}%")
+print(f"  median firings per feature: {np.median(_firing_counts):,.0f}")
 
 # Compare stable vs unstable
 print("=== Stable Features (n={}) ===".format(len(stable_indices)))
 print(f"  Decoder norm:      mean={decoder_norms[stable_indices].mean():.3f}, std={decoder_norms[stable_indices].std():.3f}")
 print(f"  Activation freq:   mean={activation_freq[stable_indices].mean():.4f}, std={activation_freq[stable_indices].std():.4f}")
-print(f"  Mean activation:   mean={mean_activation[stable_indices].mean():.4f}, std={mean_activation[stable_indices].std():.4f}")
+print(f"  Mean act (|firing): mean={mean_activation[stable_indices].mean():.4f}, std={mean_activation[stable_indices].std():.4f}")
 
 print("\n=== Unstable Features (n={}) ===".format(len(unstable_indices)))
 print(f"  Decoder norm:      mean={decoder_norms[unstable_indices].mean():.3f}, std={decoder_norms[unstable_indices].std():.3f}")
 print(f"  Activation freq:   mean={activation_freq[unstable_indices].mean():.4f}, std={activation_freq[unstable_indices].std():.4f}")
-print(f"  Mean activation:   mean={mean_activation[unstable_indices].mean():.4f}, std={mean_activation[unstable_indices].std():.4f}")
+print(f"  Mean act (|firing): mean={mean_activation[unstable_indices].mean():.4f}, std={mean_activation[unstable_indices].std():.4f}")
 
 def safe_hist(ax, values, bins, **kwargs):
     """hist() that tolerates constant data.
@@ -1215,10 +1266,10 @@ def compute_geometric_isolation(sae: SparseAutoencoder, k: int = 10) -> np.ndarr
 def compute_reconstruction_contribution(
     sae: SparseAutoencoder,
     activations: torch.Tensor,
-    batch_size: int = 1024,
+    batch_size: int = 8192,
     n_samples: int = 10000,
     device: str = "cuda"
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute reconstruction contribution for each feature.
 
@@ -1226,55 +1277,137 @@ def compute_reconstruction_contribution(
     HIGH value = feature is important for reconstruction (more likely stable)
     LOW value = feature is redundant (less stable)
 
+    Ablating a feature perturbs only the tokens where it was active, so averaging the MSE
+    increase over ALL sampled tokens gives (firing rate) x (impact while firing). That is
+    mechanically proportional to activation frequency, which is separately one of our
+    predictors -- so the unconditional form cannot be used to argue that reconstruction
+    contribution adds anything beyond frequency. The conditional mean, taken over firing
+    tokens only, is the part that is not already frequency. Both are returned so the size of
+    the overlap can be reported rather than assumed.
+
     Returns:
-        contributions: (n_features,) array of reconstruction contributions
+        conditional:   (n_features,) mean MSE increase over tokens where the feature fired
+        unconditional: (n_features,) mean MSE increase over all sampled tokens
     """
     sae.eval()
     n_features = sae.n_features
+    d_model = sae.d_model
 
     # Use a subset of activations for speed
     sample_indices = np.random.choice(len(activations), min(n_samples, len(activations)), replace=False)
-    sample_acts = activations[sample_indices].to(device)
-
-    contributions = np.zeros(n_features)
+    sample_acts = activations[sample_indices]
 
     print(f"Computing reconstruction contributions for {n_features} features...")
 
+    delta_sums = torch.zeros(n_features, dtype=torch.float64, device=device)
+    active_counts = torch.zeros(n_features, dtype=torch.float64, device=device)
+    n_total = len(sample_acts)
+
     with torch.no_grad():
-        # Get baseline reconstruction error
-        features = sae.encode(sample_acts)
-        baseline_recon = sae.decode(features)
-        baseline_mse = F.mse_loss(baseline_recon, sample_acts, reduction='none').mean(dim=1)
+        dec_sq_norms = sae.W_dec.pow(2).sum(dim=1)  # (n_features,), 1.0 under normalize_decoder
 
-        # For each feature, compute MSE when that feature is ablated
-        for feat_idx in tqdm(range(n_features)):
-            # Zero out this feature
-            ablated_features = features.clone()
-            ablated_features[:, feat_idx] = 0
+        # Zeroing feature j shifts the residual by exactly -f_j * W_dec[j], so the change in
+        # per-token MSE has a closed form and every feature can be done in one matmul. This
+        # is identical to ablating features one at a time, without the 2048 decode passes.
+        for start in tqdm(range(0, n_total, batch_size), desc="Ablation (closed form)"):
+            x = sample_acts[start : start + batch_size].to(device)
+            f = sae.encode(x)
+            residual = sae.decode(f) - x
+            cross = residual @ sae.W_dec.T  # (B, n_features)
+            delta = (f.pow(2) * dec_sq_norms - 2.0 * f * cross) / d_model
 
-            # Reconstruct
-            ablated_recon = sae.decode(ablated_features)
-            ablated_mse = F.mse_loss(ablated_recon, sample_acts, reduction='none').mean(dim=1)
+            delta_sums += delta.sum(dim=0).double()
+            active_counts += (f > 0).sum(dim=0).double()
 
-            # Contribution = increase in MSE when feature is removed
-            contribution = (ablated_mse - baseline_mse).mean().cpu().item()
-            contributions[feat_idx] = contribution
+    delta_sums = delta_sums.cpu().numpy()
+    active_counts = active_counts.cpu().numpy()
 
-    return contributions
+    unconditional = delta_sums / max(n_total, 1)
+    # delta is exactly zero wherever the feature did not fire, so the running sum over all
+    # tokens already equals the sum over firing tokens.
+    conditional = np.divide(
+        delta_sums, active_counts, out=np.zeros_like(delta_sums), where=active_counts > 0
+    )
+    return conditional, unconditional
 
-# Compute all four statistics
+def compute_encoder_stats(sae):
+    """Encoder-side single-run statistics.
+
+    Everything else here describes the decoder or the activations it produces, but the
+    encoder is what actually decides whether a feature fires: b_enc is literally the
+    activation threshold, and the encoder column norm sets how sharply the feature responds.
+    Both are free to read off the weights and neither is constrained by normalize_decoder.
+    """
+    enc = sae.W_enc.detach()  # (d_model, n_features)
+    return enc.norm(dim=0).cpu().numpy(), sae.b_enc.detach().cpu().numpy()
+
+
+def compute_single_run_statistics(sae, activations, device, k=10, n_samples=10000, label=""):
+    """Every predictor available from ONE SAE, with no reference to any other seed.
+
+    Returned as a dict so the same code path can produce the reference seed's statistics and
+    a held-out seed's, guaranteeing the two are computed identically.
+    """
+    suffix = f" ({label})" if label else ""
+    print(f"Computing geometric isolation{suffix}...")
+    isolation = compute_geometric_isolation(sae, k=k)
+
+    print(f"Computing activation statistics{suffix}...")
+    freq, mean_act = compute_activation_stats(
+        sae, activations, device, desc=f"activation stats{suffix}"
+    )
+
+    print(f"Computing reconstruction contribution{suffix}...")
+    recon_cond, recon_uncond = compute_reconstruction_contribution(
+        sae, activations, n_samples=n_samples, device=device
+    )
+
+    enc_norm, enc_bias = compute_encoder_stats(sae)
+
+    return {
+        "activation_freq": freq,
+        "mean_activation": mean_act,
+        "geometric_isolation": isolation,
+        "recon_contribution": recon_cond,
+        "recon_contribution_uncond": recon_uncond,
+        "encoder_norm": enc_norm,
+        "encoder_bias": enc_bias,
+        "decoder_norm": sae.W_dec.detach().cpu().norm(dim=1).numpy(),
+    }
+
+
 print("Computing geometric isolation...")
 geometric_isolation = compute_geometric_isolation(reference_sae, k=10)
 
 print("\nComputing reconstruction contribution...")
-recon_contribution = compute_reconstruction_contribution(
+recon_contribution, recon_contribution_uncond = compute_reconstruction_contribution(
     reference_sae,
     activations,
     n_samples=10000,
     device=CONFIG["device"]
 )
 
-print("\nDone! All four statistics computed.")
+encoder_norm, encoder_bias = compute_encoder_stats(reference_sae)
+
+# How much of each statistic is really just activation frequency wearing a different hat.
+# The unconditional ablation is (firing rate) x (impact while firing) by construction, so a
+# near-1.0 correlation there is expected and is the reason the conditional form is used
+# instead; anything else near 1.0 would mean that predictor is not independent evidence.
+print("\n=== Frequency confound check (Spearman rho vs activation frequency) ===")
+from scipy.stats import spearmanr
+
+for _name, _values in [
+    ("recon contribution (conditional, used)", recon_contribution),
+    ("recon contribution (unconditional)", recon_contribution_uncond),
+    ("mean activation | firing", mean_activation),
+    ("geometric isolation", geometric_isolation),
+    ("encoder column norm", encoder_norm),
+    ("encoder bias", encoder_bias),
+]:
+    _rho = spearmanr(activation_freq, _values).statistic
+    print(f"  {_name:42s}: rho={_rho:+.3f}")
+
+print("\nDone! All predictors computed.")
 
 # Compare all four statistics between stable and unstable features
 print("=" * 60)
@@ -1344,20 +1477,51 @@ from sklearn.metrics import roc_auc_score, classification_report, confusion_matr
 # Only train on features with a definite label (exclude the discarded middle)
 labeled_mask = stable_mask | unstable_mask
 
-X = np.column_stack([
-    activation_freq,
-    geometric_isolation,
-    recon_contribution,
-    mean_activation,
-])[labeled_mask]
+# Firing rates and activation magnitudes are heavy-tailed over several orders of magnitude,
+# and logistic regression fits a boundary that is linear in whatever it is handed. Left in
+# raw units, the multivariable model can recruit the other predictors purely to bend the
+# frequency response, which would show up as those predictors "adding signal" when they are
+# only supplying curvature. Note this does NOT change any single-predictor AUROC: one
+# logistic regression coefficient is monotone in its input, AUROC depends only on ranking,
+# and a log is monotone. It only makes the multivariable comparison honest.
+LOG_EPS = 1e-10
+
+
+def build_predictors(stats):
+    """(name, values) for every predictor, from one SAE's statistics dict.
+
+    Single code path so the reference seed and any held-out seed are guaranteed to be
+    described by identically constructed columns in identical order.
+    """
+    return [
+        ("Activation Freq (log)", np.log10(stats["activation_freq"] + LOG_EPS)),
+        ("Geometric Isolation", stats["geometric_isolation"]),
+        ("Recon Contribution", stats["recon_contribution"]),
+        ("Mean Activation (log)", np.log10(stats["mean_activation"] + LOG_EPS)),
+        ("Encoder Norm", stats["encoder_norm"]),
+        ("Encoder Bias", stats["encoder_bias"]),
+    ]
+
+
+reference_stats = {
+    "activation_freq": activation_freq,
+    "mean_activation": mean_activation,
+    "geometric_isolation": geometric_isolation,
+    "recon_contribution": recon_contribution,
+    "encoder_norm": encoder_norm,
+    "encoder_bias": encoder_bias,
+}
+
+PREDICTORS = build_predictors(reference_stats)
+feature_names = [name for name, _ in PREDICTORS]
+log_activation_freq = dict(PREDICTORS)["Activation Freq (log)"]
+
+X = np.column_stack([values for _, values in PREDICTORS])[labeled_mask]
 
 y = stable_mask[labeled_mask].astype(int)
 
 print(f"Features excluded from classifier training (discarded middle): {middle_mask.sum()}")
 print(f"Features used for classifier training: {labeled_mask.sum()}")
-
-# Feature names for interpretation
-feature_names = ["Activation Freq", "Geometric Isolation", "Recon Contribution", "Mean Activation"]
 
 print(f"Feature matrix shape: {X.shape}")
 print(f"Label distribution: {y.sum()} stable, {len(y) - y.sum()} unstable")
@@ -1405,12 +1569,7 @@ print("SINGLE-FEATURE CLASSIFIERS (Isolated Effects)")
 print("-" * 60)
 
 single_feature_results = {}
-for name, values in [
-    ("Activation Freq", activation_freq),
-    ("Geometric Isolation", geometric_isolation),
-    ("Recon Contribution", recon_contribution),
-    ("Mean Activation", mean_activation),
-]:
+for name, values in PREDICTORS:
     values_labeled = values[labeled_mask]
     X_single = values_labeled.reshape(-1, 1)
     X_single_scaled = StandardScaler().fit_transform(X_single)
@@ -1431,7 +1590,7 @@ print("COMBINED CLASSIFIERS")
 print("-" * 60)
 
 # Frequency + Geometric isolation
-X_freq_geom = np.column_stack([activation_freq, geometric_isolation])[labeled_mask]
+X_freq_geom = np.column_stack([log_activation_freq, geometric_isolation])[labeled_mask]
 X_fg_scaled = StandardScaler().fit_transform(X_freq_geom)
 clf_fg = LogisticRegression(class_weight='balanced', random_state=42)
 fg_auroc = cross_val_score(clf_fg, X_fg_scaled, y, cv=cv, scoring='roc_auc')
@@ -1449,7 +1608,7 @@ for i, name in enumerate(feature_names):
     print(f"      Without {name}: {ablated_auroc.mean():.3f} (drop: {drop:+.3f})")
 
 # Full model
-print(f"\n   Full Model (All 4 Features):")
+print(f"\n   Full Model ({len(feature_names)} predictors):")
 print(f"      AUROC: {auroc_scores.mean():.3f} (+/- {auroc_scores.std() * 2:.3f})")
 
 # Summary
@@ -1465,3 +1624,122 @@ if auroc_scores.mean() >= 0.75:
     print("\nHypothesis 1 SUPPORTED: AUROC >= 0.75")
 else:
     print(f"\nHypothesis 1 NOT YET SUPPORTED: AUROC = {auroc_scores.mean():.3f} < 0.75")
+
+"""## 11. Does the headline number survive its own methodology choices?
+
+Three checks, each aimed at a way the AUROC above could be an artifact of a labelling
+decision rather than a property of the SAE:
+
+  1. Endpoint binarization discards the ambiguous middle, which removes the hardest cases
+     before scoring. Re-run over ALL features under p_hat >= 0.5 to size that effect.
+  2. Many-to-one matching lets several anchor features claim one partner, so a crowded
+     region could read as stable. Re-derive the labels with one-to-one Hungarian matching
+     and see whether geometric isolation's predictive power moves with them.
+  3. Cross-validation holds out features from the SAME dictionary, and geometric isolation
+     is relational -- a feature's value depends on neighbours that may sit in the training
+     fold. Train on the reference seed and test on a different seed's dictionary entirely.
+"""
+
+print("\n" + "=" * 60)
+print("ROBUSTNESS OF THE EVALUATION ITSELF")
+print("=" * 60)
+
+
+def cv_auroc(values, labels, mask):
+    """Cross-validated AUROC under the shared protocol, for any predictor set and labelling."""
+    cols = values if values.ndim == 2 else values.reshape(-1, 1)
+    X_local = StandardScaler().fit_transform(cols[mask])
+    y_local = labels[mask].astype(int)
+    if len(np.unique(y_local)) < 2:
+        return float("nan")
+    model = LogisticRegression(class_weight="balanced", random_state=42, max_iter=1000)
+    return cross_val_score(model, X_local, y_local, cv=cv, scoring="roc_auc").mean()
+
+
+X_all = np.column_stack([values for _, values in PREDICTORS])
+
+# --- 1. how much does discarding the ambiguous middle flatter the result? ---
+print("\n1. Effect of discarding the ambiguous middle")
+all_mask = np.ones(len(reappearance_probs), dtype=bool)
+midpoint_labels = reappearance_probs >= 0.5
+endpoint_auroc = cv_auroc(X_all, stable_mask, labeled_mask)
+midpoint_auroc = cv_auroc(X_all, midpoint_labels, all_mask)
+print(f"   endpoint only  (n={labeled_mask.sum():4d}, the reported figure): {endpoint_auroc:.3f}")
+print(f"   all features   (n={all_mask.sum():4d}, p_hat >= 0.5)           : {midpoint_auroc:.3f}")
+print(f"   inflation attributable to discarding {middle_mask.sum()} features: "
+      f"{endpoint_auroc - midpoint_auroc:+.3f}")
+
+# --- 2. do the labels, and isolation's power over them, depend on the matching rule? ---
+print("\n2. Effect of the matching rule (many-to-one vs one-to-one)")
+from scipy.optimize import linear_sum_assignment
+
+_seeds = list(trained_saes.keys())
+_anchor_sae = trained_saes[_seeds[0]]
+_hungarian_counts = np.zeros(_anchor_sae.n_features)
+for _other in _seeds[1:]:
+    _sim = compute_decoder_similarity(_anchor_sae, trained_saes[_other]).numpy()
+    _rows, _cols = linear_sum_assignment(-_sim)
+    _assigned = np.full(_anchor_sae.n_features, -1.0)
+    _assigned[_rows] = _sim[_rows, _cols]
+    _hungarian_counts += (_assigned >= THETA).astype(float)
+
+hungarian_probs = _hungarian_counts / max(len(_seeds) - 1, 1)
+hungarian_stable = hungarian_probs >= (1 - EPSILON)
+hungarian_labeled = hungarian_stable | (hungarian_probs <= EPSILON)
+
+print(f"   stable fraction  many-to-one: {stable_mask.mean():6.1%}   "
+      f"one-to-one: {hungarian_stable.mean():6.1%}")
+print(f"   labels changed by switching rule: "
+      f"{int((stable_mask != hungarian_stable).sum())} of {len(stable_mask)} features")
+_iso = geometric_isolation
+print(f"   geometric isolation alone, many-to-one labels: "
+      f"{cv_auroc(_iso, stable_mask, labeled_mask):.3f}")
+print(f"   geometric isolation alone, one-to-one labels : "
+      f"{cv_auroc(_iso, hungarian_stable, hungarian_labeled):.3f}")
+print(f"   full model,                one-to-one labels : "
+      f"{cv_auroc(X_all, hungarian_stable, hungarian_labeled):.3f}")
+print("   (a large gap here would mean isolation is tracking the matcher, not stability)")
+
+# --- 3. does the classifier transfer to a dictionary it was not trained on? ---
+print("\n3. Transfer to a held-out dictionary (the deployment claim)")
+if len(_seeds) < 3:
+    print("   Needs >=3 seeds: the held-out seed must itself have two comparisons. Skipped.")
+else:
+    held_out_seed = _seeds[1]
+    # Same budget, same eval activations, same code path -- only the dictionary differs, so a
+    # drop here is transfer failure and not a difference in training budget or in measurement.
+    held_out_saes = {held_out_seed: trained_saes[held_out_seed]}
+    held_out_saes.update({s: trained_saes[s] for s in _seeds if s != held_out_seed})
+    held_out_probs, _ = compute_reappearance_probability(held_out_saes, theta=THETA)
+    held_out_stable = held_out_probs >= (1 - EPSILON)
+    held_out_mask = held_out_stable | (held_out_probs <= EPSILON)
+
+    held_out_stats = compute_single_run_statistics(
+        trained_saes[held_out_seed], activations, CONFIG["device"],
+        label=f"seed {held_out_seed}",
+    )
+    X_held = np.column_stack([v for _, v in build_predictors(held_out_stats)])
+
+    transfer_clf = LogisticRegression(class_weight="balanced", random_state=42, max_iter=1000)
+    transfer_scaler = StandardScaler().fit(X_all[labeled_mask])
+    transfer_clf.fit(transfer_scaler.transform(X_all[labeled_mask]), stable_mask[labeled_mask])
+
+    held_truth = held_out_stable[held_out_mask].astype(int)
+
+    # Two ways to normalize the held-out dictionary, which answer different questions.
+    # Reusing the training scaler also requires the raw scales to agree across dictionaries;
+    # refitting on the held-out SAE asks only whether the learned relationship transfers,
+    # and matches what a practitioner would do with an SAE in hand.
+    transfer_auroc = roc_auc_score(held_truth, transfer_clf.predict_proba(
+        transfer_scaler.transform(X_held[held_out_mask]))[:, 1])
+    refit_auroc = roc_auc_score(held_truth, transfer_clf.predict_proba(
+        StandardScaler().fit_transform(X_held)[held_out_mask])[:, 1])
+
+    print(f"   trained on seed {_seeds[0]}, tested on seed {held_out_seed} "
+          f"(n={held_out_mask.sum()}, {held_truth.sum()} stable)")
+    print(f"   within-dictionary (cross-validated)     : {endpoint_auroc:.3f}")
+    print(f"   held-out, training-set scaler           : {transfer_auroc:.3f}")
+    print(f"   held-out, rescaled on the held-out SAE  : {refit_auroc:.3f}")
+    print(f"   transfer cost (rescaled)                : {refit_auroc - endpoint_auroc:+.3f}")
+    print("   (the held-out number is the one that supports 'use this on an SAE you did "
+          "not train')")
