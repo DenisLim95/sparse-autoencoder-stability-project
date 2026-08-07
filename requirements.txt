@@ -1,0 +1,23 @@
+# Dependencies for prelim_experiments_update.py and prelim_experiments_update.ipynb.
+#   pip install -r requirements.txt
+#
+# Nothing is pinned. That is deliberate for torch above all: an unpinned requirement is
+# satisfied by whatever build is already installed, so pip leaves the CUDA-matched wheel that
+# ships on a GPU image untouched, while still installing torch on a machine that has none.
+# Pinning it would risk replacing a working GPU build with one that cannot see the device.
+#
+# google.colab is not listed: it exists only on Colab and the script guards that import.
+
+transformer-lens
+transformers
+datasets
+huggingface_hub
+
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+tqdm
+
+torch
