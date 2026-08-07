@@ -179,6 +179,15 @@ RUN_NAME = (
     f"_{_token_label(max(CHECKPOINT_TOKENS))}tok{_objective_tag}"
 )
 OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
+
+# Hub paths are scoped by objective for the same reason the local directory is, and it matters
+# more here: SAE_HF_REPO is both the upload and the download location, so without this a TopK
+# run would pull the L1 checkpoints out of the shared repo into its own directory and then
+# refuse to resume from them -- a configuration mistake that presents as a crash. The default
+# L1 run keeps the original flat prefixes so every file already on the Hub still resolves.
+_hub_scope = f"/{_objective_tag.lstrip('_')}" if _objective_tag else ""
+HUB_CHECKPOINT_PREFIX = f"checkpoints{_hub_scope}"
+HUB_RESULTS_PREFIX = f"results{_hub_scope}"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -423,7 +432,8 @@ def rolling_checkpoint_name(seeds) -> str:
     return "shared_latest_seeds" + "-".join(str(s) for s in sorted(seeds)) + ".pt"
 
 
-def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path, seeds=None):
+def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path, seeds=None,
+                                 prefix: str = "checkpoints"):
     """Pull any milestone checkpoints already on the Hub into the local checkpoint dir.
 
     Leased GPU machines get replaced, and the replacement arrives with an empty disk. Since
@@ -431,12 +441,13 @@ def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path, seeds=None)
     them here means a run continues on a new machine instead of restarting from zero.
 
     Restricted to `seeds` when given, so seeding from a collaborator's repo doesn't drag down
-    checkpoints for seeds this run isn't training.
+    checkpoints for seeds this run isn't training. `prefix` scopes the search to one
+    objective's subdirectory, so a run never restores weights trained under a different one.
     """
     from huggingface_hub import HfApi, hf_hub_download
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    pattern = re.compile(r"checkpoints/seed(\d+)_tokens\d+\.pt")
+    pattern = re.compile(rf"{re.escape(prefix)}/seed(\d+)_tokens\d+\.pt")
     try:
         remote = []
         for f in HfApi().list_repo_files(repo_id, repo_type="model"):
@@ -514,6 +525,8 @@ def train_saes_shared_stream(
     checkpoint_dir,
     hf_repo_id=None,
     seed_repo_id=None,
+    hub_checkpoint_prefix="checkpoints",
+    hub_results_prefix="results",
     checkpoint_every_seconds=CHECKPOINT_EVERY_SECONDS,
     log_every_steps=LOG_EVERY_STEPS,
 ):
@@ -557,12 +570,16 @@ def train_saes_shared_stream(
         # with a warning and the run would silently persist nothing off-box. Fail loudly
         # here instead: if the mirror cannot work, better to know before training starts.
         hf_api.create_repo(hf_repo_id, repo_type="model", private=True, exist_ok=True)
-        restore_checkpoints_from_hub(hf_repo_id, checkpoint_dir, seeds)
+        restore_checkpoints_from_hub(
+            hf_repo_id, checkpoint_dir, seeds, prefix=hub_checkpoint_prefix
+        )
 
     # Second, so our own further-along checkpoints win: restore only fetches what is missing.
     if seed_repo_id is not None:
         print(f"Seeding from collaborator repo hf.co/{seed_repo_id} (read-only)")
-        restore_checkpoints_from_hub(seed_repo_id, checkpoint_dir, seeds)
+        restore_checkpoints_from_hub(
+            seed_repo_id, checkpoint_dir, seeds, prefix=hub_checkpoint_prefix
+        )
 
     def mirror_to_hub(path: Path, path_in_repo: str):
         if hf_api is None:
@@ -743,13 +760,13 @@ def train_saes_shared_stream(
                 ckpt_name = f"seed{s}_tokens{milestone}.pt"
                 ckpt_path = checkpoint_dir / ckpt_name
                 save_checkpoint_atomic(build_seed_state(s), ckpt_path)
-                mirror_to_hub(ckpt_path, f"checkpoints/{ckpt_name}")
+                mirror_to_hub(ckpt_path, f"{hub_checkpoint_prefix}/{ckpt_name}")
 
             save_checkpoint_atomic(build_shared_state(), checkpoint_dir / rolling_checkpoint_name(seeds))
             write_histories()
             for s in seeds:
                 name = f"training_history_seed{s}.json"
-                mirror_to_hub(checkpoint_dir.parent / name, f"results/{name}")
+                mirror_to_hub(checkpoint_dir.parent / name, f"{hub_results_prefix}/{name}")
 
             print(f"milestone reached: all {len(seeds)} seeds checkpointed at "
                   f"{milestone:,} tokens -- runnable through stability_check.py now"
@@ -782,6 +799,8 @@ trained_saes, training_histories = train_saes_shared_stream(
     checkpoint_dir=CHECKPOINT_DIR,
     hf_repo_id=HF_REPO_ID,
     seed_repo_id=SEED_REPO_ID,
+    hub_checkpoint_prefix=HUB_CHECKPOINT_PREFIX,
+    hub_results_prefix=HUB_RESULTS_PREFIX,
 )
 
 print(f"\nTrained {len(trained_saes)} SAEs with seeds: {list(trained_saes.keys())}")
