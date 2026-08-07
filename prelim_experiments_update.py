@@ -1202,19 +1202,33 @@ print(f"  Activation freq:   mean={activation_freq[unstable_indices].mean():.4f}
 print(f"  Mean act (|firing): mean={mean_activation[unstable_indices].mean():.4f}, std={mean_activation[unstable_indices].std():.4f}")
 
 def safe_hist(ax, values, bins, **kwargs):
-    """hist() that tolerates constant data.
+    """hist() that tolerates effectively-constant data.
 
-    normalize_decoder() pins every decoder norm to exactly 1.0, so the decoder-norm
-    histogram has zero range and matplotlib raises "Too many bins for data range".
-    That would abort the script after training has already finished, so degrade to a
-    single bin instead of losing the whole analysis to a plotting detail.
+    normalize_decoder() pins every decoder norm to 1.0, so the decoder-norm histogram has no
+    usable range and matplotlib raises "Too many bins for data range". That would abort the
+    script after training has already finished, so degrade to a single bar instead of losing
+    the whole analysis to a plotting detail.
+
+    The test is relative, not a fixed epsilon. Renormalizing every step leaves norms that
+    differ in the last few bits rather than being bit-identical: a span around 1e-7 at values
+    around 1.0, which clears any small absolute threshold while still being far too narrow to
+    cut into 30 distinct float32 bin edges. An absolute cutoff therefore passes runs where the
+    norms happen to land exactly equal and crashes ones where they do not, which is a
+    coin-flip on the arithmetic rather than a property of the data.
     """
-    values = np.asarray(values)
+    values = np.asarray(values, dtype=np.float64).ravel()
+    values = values[np.isfinite(values)]
     if values.size == 0:
         return
-    lo, hi = float(np.min(values)), float(np.max(values))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-12:
-        ax.hist(values, bins=1, range=(lo - 0.5, lo + 0.5), **kwargs)
+    lo, hi = float(values.min()), float(values.max())
+    # Scaled by the data's own magnitude with no floor, so a predictor that genuinely varies
+    # over a narrow range near zero still gets binned properly instead of being flattened
+    # along with the decoder norms.
+    scale = max(abs(lo), abs(hi))
+    # Below this the bars are indistinguishable on screen anyway, so one bar is the honest
+    # rendering as well as the numerically safe one.
+    if hi - lo <= 1e-6 * scale:
+        ax.hist(values, bins=1, range=(lo - 0.5, hi + 0.5), **kwargs)
     else:
         ax.hist(values, bins=bins, **kwargs)
 
