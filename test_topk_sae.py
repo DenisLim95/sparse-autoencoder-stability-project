@@ -9,7 +9,18 @@ selected latents, and that the L1 path is byte-identical to what it was before t
 existed. Selecting on pre-activations rather than after the ReLU is the subtle part, and
 getting it wrong produces an SAE that trains fine while silently activating features that
 carry no signal.
+
+Runs on CPU in a few seconds and needs no GPU, so it is safe on a contended shared node.
 """
+
+import os
+
+# Before importing torch, and deliberately: this test is pure CPU maths, but Adam.step() runs
+# an unconditional accelerator health check that queries the CUDA stream anyway. On a shared
+# node whose GPUs are all held in Exclusive_Process mode that check raises
+# cudaErrorDevicesUnavailable, failing the test for reasons having nothing to do with the SAE.
+# Hiding the devices removes the accelerator entirely, so the result depends only on the code.
+os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 from pathlib import Path
 from typing import Tuple
