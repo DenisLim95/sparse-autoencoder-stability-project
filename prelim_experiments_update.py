@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm.auto import tqdm
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 from transformer_lens import HookedTransformer
 from datasets import load_dataset
 
@@ -43,6 +43,31 @@ CONFIG = {
     # notebook when clearing a setting) reads as unset instead of crashing on int("").
     "sparsity": os.environ.get("SAE_SPARSITY") or "l1",  # "l1" | "topk"
     "k": int(os.environ.get("SAE_TOPK_K") or 32),  # active latents per token, TopK only
+    # --- dead-latent mitigations (Gao et al. 2024, the two ingredients they name) ---------
+    # The first TopK run reached 60% dead latents and a median of zero firings per feature
+    # across 1.3M eval tokens, which does not merely waste capacity: a never-firing latent is
+    # labelled unstable automatically (its decoder row never left initialization, so nothing
+    # matches it) and has frequency exactly zero, so the classifier separates the classes by
+    # spotting corpses. That run scored AUROC 0.981, the highest of any, which is how we know
+    # the metric was measuring dictionary rot rather than predictability.
+    #
+    # tied_init: start each latent's encoder (read) direction parallel to its decoder (write)
+    # direction. Initialization only -- the two are free to diverge, unlike the permanently
+    # tied weights of Cunningham et al. 2023. Most of the death happened between step 200 and
+    # 400, before any latent had learned anything, which is the window this governs.
+    # auxk_coeff: weight on the auxiliary loss that lets dead latents reconstruct the residual
+    # error, so a latent frozen out of the top-k still receives gradient. 0 disables it.
+    "tied_init": (os.environ.get("SAE_TIED_INIT") or "").lower() not in ("0", "false")
+    if os.environ.get("SAE_TIED_INIT")
+    else os.environ.get("SAE_SPARSITY") == "topk",
+    "auxk_coeff": float(
+        os.environ.get("SAE_AUXK_COEFF")
+        if os.environ.get("SAE_AUXK_COEFF")
+        else (1.0 / 32 if os.environ.get("SAE_SPARSITY") == "topk" else 0.0)
+    ),
+    "auxk_k": int(os.environ.get("SAE_AUXK_K") or 512),  # dead latents entered per step
+    # A latent counts as dead once it has not fired for this many tokens (Gao et al. use 10M).
+    "auxk_dead_after_tokens": int(os.environ.get("SAE_AUXK_DEAD_AFTER") or 10_000_000),
     # Every checkpoint on both Hub repos (1M through 8B, all seeds) was trained at 1.0 --
     # verified from each checkpoint's saved config and cross-checked against the recorded
     # losses. Resuming those checkpoints under a different coefficient would change the
@@ -80,6 +105,12 @@ print(f"Using device: {CONFIG['device']}")
 print(f"Training seeds: {CONFIG['seeds']}")
 if CONFIG["sparsity"] == "topk":
     print(f"Objective: TopK, k={CONFIG['k']} (L0 is exactly k by construction)")
+    print(f"  dead-latent mitigations: tied_init={CONFIG['tied_init']}, "
+          f"auxk_coeff={CONFIG['auxk_coeff']:g} "
+          f"(k_aux={CONFIG['auxk_k']}, dead after {CONFIG['auxk_dead_after_tokens']:,} tokens)")
+    if not CONFIG["tied_init"] or CONFIG["auxk_coeff"] == 0:
+        print("  WARNING: the unmitigated TopK run reached 60% dead latents and produced an "
+              "AUROC of 0.981 that was measuring dead features, not stability.")
 elif CONFIG["sparsity"] == "l1":
     _lambda_std = CONFIG["l1_coeff"] * CONFIG["d_model"] / CONFIG["n_features"]
     print(f"Objective: L1, l1_coeff={CONFIG['l1_coeff']:g} "
@@ -174,6 +205,13 @@ def _token_label(n: int) -> str:
 _objective_tag = "" if CONFIG["sparsity"] == "l1" else f"_topk{CONFIG['k']}"
 if not CONFIG["normalize_decoder"]:
     _objective_tag += "_freedec"
+# Tagged even though these default on for TopK, because the first TopK run predates them and
+# its 60%-dead checkpoints are sitting in ..._topk32. Without a distinct name the fixed run
+# would resume from them and inherit exactly the rot it exists to remove.
+if CONFIG["tied_init"]:
+    _objective_tag += "_tied"
+if CONFIG["auxk_coeff"]:
+    _objective_tag += "_auxk"
 RUN_NAME = (
     f"{CONFIG['model_name']}_L{_layer}"
     f"_{_token_label(max(CHECKPOINT_TOKENS))}tok{_objective_tag}"
@@ -293,7 +331,7 @@ class SparseAutoencoder(nn.Module):
     """
 
     def __init__(self, d_model: int, n_features: int, seed: int,
-                 sparsity: str = "l1", k: int = 32):
+                 sparsity: str = "l1", k: int = 32, tied_init: bool = False):
         super().__init__()
         torch.manual_seed(seed)
 
@@ -313,34 +351,81 @@ class SparseAutoencoder(nn.Module):
         # Initialize decoder columns to unit norm
         with torch.no_grad():
             self.W_dec.data = F.normalize(self.W_dec.data, dim=1)
+            if tied_init:
+                # Copy decoder -> encoder, not the reverse, so the unit norms just established
+                # survive. A latent then reads along the same direction it writes, so the very
+                # first time it wins the top-k it contributes something useful instead of
+                # noise, which is what keeps it in contention long enough to learn.
+                self.W_enc.data = self.W_dec.data.t().contiguous().clone()
 
-    def encode(self, x: torch.Tensor) -> torch.Tensor:
-        """Encode input to sparse feature activations."""
+    def _encode_with_pre(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (sparse activations, dense pre-activations). The auxiliary loss needs the
+        pre-activations of latents the top-k threw away, which `encode` cannot expose."""
         x_centered = x - self.b_dec
         pre_acts = x_centered @ self.W_enc + self.b_enc
+        selected = pre_acts
         if self.sparsity == "topk":
             # Select on the pre-activations, then rectify. Taking the top k of an already
             # rectified vector would pick arbitrary features out of the zeros whenever fewer
             # than k are positive, inventing activations that carry no signal.
             idx = pre_acts.topk(self.k, dim=-1).indices
             keep = torch.zeros_like(pre_acts, dtype=torch.bool).scatter_(-1, idx, True)
-            pre_acts = torch.where(keep, pre_acts, torch.zeros_like(pre_acts))
-        return F.relu(pre_acts)
+            selected = torch.where(keep, pre_acts, torch.zeros_like(pre_acts))
+        return F.relu(selected), pre_acts
+
+    def encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Encode input to sparse feature activations."""
+        return self._encode_with_pre(x)[0]
 
     def decode(self, f: torch.Tensor) -> torch.Tensor:
         """Decode feature activations back to input space."""
         return f @ self.W_dec + self.b_dec
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def auxk_loss(self, x, x_hat, pre_acts, dead_mask, k_aux):
+        """Gao et al.'s AuxK: let the currently-dead latents try to explain the main model's
+        reconstruction error. A latent that keeps losing the top-k competition otherwise
+        receives no gradient at all and stays dead permanently; here it gets one."""
+        zero = x.new_zeros(())
+        if dead_mask is None:
+            return zero
+        n_dead = int(dead_mask.sum())
+        k = min(int(k_aux), n_dead)
+        if k == 0:
+            return zero
+
+        # Only dead latents compete, so the live ones cannot crowd them out again.
+        dead_acts = F.relu(pre_acts).masked_fill(~dead_mask, 0.0)
+        idx = dead_acts.topk(k, dim=-1).indices
+        keep = torch.zeros_like(dead_acts, dtype=torch.bool).scatter_(-1, idx, True)
+        z = torch.where(keep, dead_acts, torch.zeros_like(dead_acts))
+
+        # Deliberately no b_dec: the dead latents have to explain the residual themselves, and
+        # adding the bias back in is a well-known way to get this silently wrong.
+        e_hat = z @ self.W_dec
+        # The residual is a target, not something to optimize. Detaching stops the auxiliary
+        # term from making its own job easier by degrading the main reconstruction.
+        e = (x - x_hat).detach()
+        aux = F.mse_loss(e_hat, e)
+        # Reported to go non-finite occasionally; zeroing one step beats losing the run.
+        return aux if torch.isfinite(aux) else zero
+
+    def forward(self, x: torch.Tensor, dead_mask: Optional[torch.Tensor] = None,
+                k_aux: int = 512) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Forward pass returning reconstruction, features, and loss components.
+
+        Args:
+            dead_mask: Boolean mask over features marking latents that have not fired
+                recently. None (the default, so analysis code is unaffected) skips the
+                auxiliary loss entirely.
+            k_aux: How many dead latents to enter into the auxiliary reconstruction.
 
         Returns:
             x_hat: Reconstructed input
             f: Feature activations
-            loss_dict: Dictionary with reconstruction and sparsity losses
+            loss_dict: Dictionary with reconstruction, sparsity, and auxiliary losses
         """
-        f = self.encode(x)
+        f, pre_acts = self._encode_with_pre(x)
         x_hat = self.decode(f)
 
         # Reconstruction loss (MSE)
@@ -352,7 +437,11 @@ class SparseAutoencoder(nn.Module):
         # the k surviving activations.
         sparsity_loss = f.abs().mean()
 
-        return x_hat, f, {"recon_loss": recon_loss, "sparsity_loss": sparsity_loss}
+        return x_hat, f, {
+            "recon_loss": recon_loss,
+            "sparsity_loss": sparsity_loss,
+            "aux_loss": self.auxk_loss(x, x_hat, pre_acts, dead_mask, k_aux),
+        }
 
     def normalize_decoder(self):
         """Normalize decoder columns to unit norm (call after each optimization step)."""
@@ -380,6 +469,7 @@ def empty_history() -> Dict[str, list]:
         "total_loss": [],
         "l0": [],
         "dead_frac": [],
+        "aux_loss": [],
     }
 
 
@@ -554,6 +644,7 @@ def train_saes_shared_stream(
         s: SparseAutoencoder(
             config["d_model"], config["n_features"], seed=s,
             sparsity=config["sparsity"], k=config["k"],
+            tied_init=config["tied_init"],
         ).to(device)
         for s in seeds
     }
@@ -617,6 +708,12 @@ def train_saes_shared_stream(
         prior_norm = prior.get("normalize_decoder", True)
         if prior_norm != config["normalize_decoder"]:
             mismatches.append(("normalize_decoder", prior_norm, config["normalize_decoder"]))
+        # The auxiliary loss changes what is being optimized, so switching it mid-run splits
+        # the curve in two. tied_init is deliberately not checked: it only affects step 0, and
+        # on resume the weights come from the checkpoint regardless.
+        prior_auxk = prior.get("auxk_coeff", 0.0)
+        if prior_auxk != config["auxk_coeff"]:
+            mismatches.append(("auxk_coeff", prior_auxk, config["auxk_coeff"]))
         if mismatches:
             detail = "; ".join(f"{k}: checkpoint={p!r} vs CONFIG={c!r}" for k, p, c in mismatches)
             raise SystemExit(
@@ -628,7 +725,15 @@ def train_saes_shared_stream(
         for s in seeds:
             saes[s].load_state_dict(resume["models"][s])
             optimizers[s].load_state_dict(resume["optimizers"][s])
-            histories[s] = resume["histories"].get(s, empty_history())
+            restored = resume["histories"].get(s, empty_history())
+            # Checkpoints written before a curve existed lack its key, and the logging code
+            # appends to every key unconditionally. Pad with NaN so the new series lines up
+            # with the old steps on the x-axis instead of being silently shifted left.
+            for key in empty_history():
+                restored.setdefault(
+                    key, [float("nan")] * len(restored.get("tokens_seen", []))
+                )
+            histories[s] = restored
         tokens_seen = resume["tokens_seen"]
         step = resume.get("step", 0)
         print(f"Resumed all {len(seeds)} seeds at {tokens_seen:,} tokens")
@@ -644,11 +749,17 @@ def train_saes_shared_stream(
 
     # Accumulate curve metrics as on-device tensors and only pull them to the host at
     # logging time; calling .item() every step would force a GPU sync 244k times.
-    interval_sums = {s: torch.zeros(4, device=device) for s in seeds}  # recon, sparsity, total, l0
+    # recon, sparsity, total, l0, aux
+    interval_sums = {s: torch.zeros(5, device=device) for s in seeds}
     interval_n = 0
     seen_active = {
         s: torch.zeros(config["n_features"], dtype=torch.bool, device=device) for s in seeds
     }
+    # Tokens since each latent last fired, which is how AuxK decides what counts as dead.
+    # Deliberately not checkpointed: it rebuilds itself within auxk_dead_after_tokens (about
+    # 300 steps), which is short next to the gap between milestones, and starting from zero
+    # only means the auxiliary loss stays off for that brief window after a restart.
+    tokens_idle = {s: torch.zeros(config["n_features"], device=device) for s in seeds}
     last_checkpoint_time = time.time()
 
     def build_seed_state(seed):
@@ -681,14 +792,22 @@ def train_saes_shared_stream(
     # rather than a branch so the loss and the logged l1_term cannot disagree about it.
     l1_weight = config["l1_coeff"] if config["sparsity"] == "l1" else 0.0
     unit_norm_decoder = config["normalize_decoder"]
+    auxk_coeff = config["auxk_coeff"]
+    auxk_k = config["auxk_k"]
+    dead_after = config["auxk_dead_after_tokens"]
 
     for batch in activation_stream:
         batch = batch.to(device, non_blocking=True)
 
         for s in seeds:
             sae, optimizer = saes[s], optimizers[s]
-            x_hat, f, loss_dict = sae(batch)
+            # Built from the previous steps' firing history, so it reflects what was dead on
+            # arrival at this batch rather than what this batch happens to leave out.
+            dead_mask = tokens_idle[s] > dead_after if auxk_coeff else None
+            x_hat, f, loss_dict = sae(batch, dead_mask=dead_mask, k_aux=auxk_k)
             loss = loss_dict["recon_loss"] + l1_weight * loss_dict["sparsity_loss"]
+            if auxk_coeff:
+                loss = loss + auxk_coeff * loss_dict["aux_loss"]
 
             optimizer.zero_grad()
             loss.backward()
@@ -705,7 +824,13 @@ def train_saes_shared_stream(
                 interval_sums[s][1] += loss_dict["sparsity_loss"].detach()
                 interval_sums[s][2] += loss.detach()
                 interval_sums[s][3] += active.float().sum(dim=1).mean()
-                seen_active[s] |= active.any(dim=0)
+                interval_sums[s][4] += loss_dict["aux_loss"].detach()
+                fired = active.any(dim=0)
+                seen_active[s] |= fired
+                tokens_idle[s] = torch.where(
+                    fired, torch.zeros_like(tokens_idle[s]),
+                    tokens_idle[s] + batch.shape[0],
+                )
 
         # batch is already the flattened (batch_size * seq_len, d_model) activations
         # from activation_stream_generator -- batch.shape[0] IS the real token count
@@ -717,7 +842,7 @@ def train_saes_shared_stream(
         if step % log_every_steps == 0:
             l0s, recons = [], []
             for s in seeds:
-                recon, sparsity, total, l0 = (interval_sums[s] / interval_n).tolist()
+                recon, sparsity, total, l0, aux = (interval_sums[s] / interval_n).tolist()
                 dead_frac = 1.0 - seen_active[s].float().mean().item()
                 h = histories[s]
                 h["step"].append(step)
@@ -727,6 +852,7 @@ def train_saes_shared_stream(
                 h["l1_term"].append(l1_weight * sparsity)
                 h["total_loss"].append(total)
                 h["l0"].append(l0)
+                h["aux_loss"].append(aux)
                 # Dead = never fired anywhere in this logging window.
                 h["dead_frac"].append(dead_frac)
                 l0s.append(l0)
@@ -742,11 +868,19 @@ def train_saes_shared_stream(
             # be a column of zeros; show the raw code magnitude instead.
             sparsity_col = (f"l1_term {l1_weight * mean_sparsity:.5f}" if l1_weight
                             else f"|f|_1 {mean_sparsity:.5f}")
+            # dead% is the headline number to watch under TopK: it climbed to 60% by 100M
+            # tokens without these mitigations, and aux shows whether the revival term is
+            # actually doing anything (it is exactly 0 while no latent has been idle long
+            # enough to qualify, which is expected early on).
+            aux_col = ""
+            if auxk_coeff:
+                mean_aux = np.mean([histories[s]["aux_loss"][-1] for s in seeds])
+                aux_col = f" | aux {mean_aux:.5f}"
             print(f"step {step:>7} | {tokens_seen:>14,} tok | "
                   f"recon {np.mean(recons):.5f} | "
                   f"{sparsity_col} | "
                   f"L0 {np.mean(l0s):6.1f} ({min(l0s):.0f}-{max(l0s):.0f}) | "
-                  f"dead {worst_dead:5.1f}%")
+                  f"dead {worst_dead:5.1f}%{aux_col}")
 
         if time.time() - last_checkpoint_time >= checkpoint_every_seconds:
             save_checkpoint_atomic(build_shared_state(), checkpoint_dir / rolling_checkpoint_name(seeds))
@@ -851,6 +985,12 @@ def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_pat
         axes[0, 1].plot(h["tokens_seen"], h["l1_term"],
                         label=f"l1_coeff x L1 ({config['l1_coeff']:g})")
         axes[0, 1].set_title(f"Loss terms compared (seed {anchor_seed})")
+    # Only worth a line once some latent has actually been idle long enough to qualify as
+    # dead; before that the series is a flat zero that a log axis cannot draw.
+    _aux = np.asarray(h.get("aux_loss") or [], dtype=float)
+    if config["auxk_coeff"] and np.any(_aux > 0):
+        axes[0, 1].plot(h["tokens_seen"], config["auxk_coeff"] * _aux,
+                        label=f"auxk_coeff x AuxK ({config['auxk_coeff']:g})")
     axes[0, 1].set_yscale("log")
     axes[0, 1].set_ylabel("Loss term")
 
@@ -884,13 +1024,22 @@ def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_pat
             live = config["n_features"] * (1 - worst_dead / 100)
             print(f"\n  WARNING: up to {worst_dead:.1f}% of features never fired in the last "
                   f"logging window, leaving about {live:.0f} of {config['n_features']} live. "
-                  f"TopK strands latents this way, which is why the published recipe adds an "
-                  f"auxiliary revival loss. This matters for the result and not just for "
-                  f"capacity: a dead feature's decoder row stays near initialization, so "
-                  f"nothing matches it and it is labelled unstable, while its activation "
-                  f"frequency is exactly zero. The classifier can then separate the classes "
-                  f"by detecting dead features, inflating AUROC while learning nothing about "
-                  f"real ones. Exclude never-firing features before trusting the number.")
+                  f"TopK strands latents this way: one that loses the top-k competition gets "
+                  f"no gradient and cannot recover on its own. This matters for the result and "
+                  f"not just for capacity -- a dead feature's decoder row stays near "
+                  f"initialization, so nothing matches it and it is labelled unstable, while "
+                  f"its activation frequency is exactly zero, so the classifier can separate "
+                  f"the classes by detecting corpses.")
+            if config["auxk_coeff"] and config["tied_init"]:
+                print(f"  Both mitigations are already on (tied init, auxk_coeff="
+                      f"{config['auxk_coeff']:g}), so this level of death means they were not "
+                      f"enough here: try a larger k, a smaller dictionary, or a higher "
+                      f"auxk_coeff. The MIN_FIRINGS floor below keeps the AUROC honest either "
+                      f"way, at the cost of scoring a smaller dictionary.")
+            else:
+                print(f"  Enable the mitigations before trusting any of this: "
+                      f"SAE_TIED_INIT=1 SAE_AUXK_COEFF=0.03125 (currently tied_init="
+                      f"{config['tied_init']}, auxk_coeff={config['auxk_coeff']:g}).")
         else:
             print(f"\n  Dead fraction at most {worst_dead:.1f}%; the dictionary is in use and "
                   f"L0 is pinned at k by construction, so there is no sparsity to tune.")
@@ -1145,6 +1294,14 @@ print(f"Eval activations shape: {activations.shape}")
 STAT_BATCH = 4096  # reduce to 1024 if still OOM
 
 
+# A conditional statistic estimated from a handful of firings is mostly sampling noise: at 10
+# firings the mean carries roughly +/-30% error, and a latent that never fires has no
+# conditional mean to speak of. Features below this floor get NaN for every conditional
+# statistic and are dropped from the classifier, rather than being handed a fabricated 0.0
+# that the classifier can then use to identify them.
+MIN_FIRINGS = int(os.environ.get("SAE_MIN_FIRINGS") or 100)
+
+
 def compute_activation_stats(sae, activations, device, batch_size=STAT_BATCH, desc="feature stats"):
     """Firing rate and firing strength for every feature of a single SAE.
 
@@ -1152,6 +1309,9 @@ def compute_activation_stats(sae, activations, device, batch_size=STAT_BATCH, de
     the sum of activations divided by ALL tokens -- is identically
     (firing rate) x (conditional mean), so using it as a predictor alongside activation
     frequency would double-count frequency rather than contribute anything new.
+
+    Returns (activation_freq, mean_activation, firing_counts). The raw counts come back
+    because they, not the rate, determine whether the conditional statistics mean anything.
     """
     n_total = len(activations)
     freq_accum = torch.zeros(sae.n_features)
@@ -1166,14 +1326,15 @@ def compute_activation_stats(sae, activations, device, batch_size=STAT_BATCH, de
 
     firing_counts = freq_accum.numpy()
     activation_freq = firing_counts / max(n_total, 1)
+    enough = firing_counts >= MIN_FIRINGS
     mean_activation = np.divide(
         sum_accum.numpy(), firing_counts,
-        out=np.zeros(sae.n_features), where=firing_counts > 0,
+        out=np.full(sae.n_features, np.nan), where=enough,
     )
-    return activation_freq, mean_activation
+    return activation_freq, mean_activation, firing_counts
 
 
-activation_freq, mean_activation = compute_activation_stats(
+activation_freq, mean_activation, firing_counts = compute_activation_stats(
     reference_sae, activations, CONFIG["device"], desc="reference-seed feature stats"
 )
 
@@ -1182,24 +1343,28 @@ activation_freq, mean_activation = compute_activation_stats(
 # several significant figures here; only a substantial low-count tail would justify the
 # streaming rewrite that reaching the intended 100M tokens requires (the eval set is
 # materialized as one tensor, so 100M tokens would be ~205 GB).
-_firing_counts = activation_freq * len(activations)
 print(f"\n=== Is {len(activations):,} eval tokens enough? (frequency estimate quality) ===")
-for _thresh in (10, 100, 1000):
-    _n = int((_firing_counts < _thresh).sum())
+for _thresh in (1, 10, 100, 1000):
+    _n = int((firing_counts < _thresh).sum())
     print(f"  features firing < {_thresh:5,} times: {_n:5d} "
           f"({_n / len(activation_freq):5.1%}) -- relative error >~ {100 / max(_thresh, 1) ** 0.5:.0f}%")
-print(f"  median firings per feature: {np.median(_firing_counts):,.0f}")
+print(f"  median firings per feature: {np.median(firing_counts):,.0f}")
+print(f"  never fire at all: {int((firing_counts == 0).sum())} "
+      f"({(firing_counts == 0).mean():.1%})")
+print(f"  below the MIN_FIRINGS={MIN_FIRINGS} floor, so excluded from the classifier: "
+      f"{int((firing_counts < MIN_FIRINGS).sum())} "
+      f"({(firing_counts < MIN_FIRINGS).mean():.1%})")
 
 # Compare stable vs unstable
 print("=== Stable Features (n={}) ===".format(len(stable_indices)))
 print(f"  Decoder norm:      mean={decoder_norms[stable_indices].mean():.3f}, std={decoder_norms[stable_indices].std():.3f}")
 print(f"  Activation freq:   mean={activation_freq[stable_indices].mean():.4f}, std={activation_freq[stable_indices].std():.4f}")
-print(f"  Mean act (|firing): mean={mean_activation[stable_indices].mean():.4f}, std={mean_activation[stable_indices].std():.4f}")
+print(f"  Mean act (|firing): mean={np.nanmean(mean_activation[stable_indices]):.4f}, std={np.nanstd(mean_activation[stable_indices]):.4f}")
 
 print("\n=== Unstable Features (n={}) ===".format(len(unstable_indices)))
 print(f"  Decoder norm:      mean={decoder_norms[unstable_indices].mean():.3f}, std={decoder_norms[unstable_indices].std():.3f}")
 print(f"  Activation freq:   mean={activation_freq[unstable_indices].mean():.4f}, std={activation_freq[unstable_indices].std():.4f}")
-print(f"  Mean act (|firing): mean={mean_activation[unstable_indices].mean():.4f}, std={mean_activation[unstable_indices].std():.4f}")
+print(f"  Mean act (|firing): mean={np.nanmean(mean_activation[unstable_indices]):.4f}, std={np.nanstd(mean_activation[unstable_indices]):.4f}")
 
 def safe_hist(ax, values, bins, **kwargs):
     """hist() that tolerates effectively-constant data.
@@ -1453,9 +1618,9 @@ def compute_reconstruction_contribution(
     sae: SparseAutoencoder,
     activations: torch.Tensor,
     batch_size: int = 8192,
-    n_samples: int = 10000,
+    n_samples: Optional[int] = None,
     device: str = "cuda"
-) -> Tuple[np.ndarray, np.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute reconstruction contribution for each feature.
 
@@ -1474,16 +1639,24 @@ def compute_reconstruction_contribution(
     Returns:
         conditional:   (n_features,) mean MSE increase over tokens where the feature fired
         unconditional: (n_features,) mean MSE increase over all sampled tokens
+        active_counts: (n_features,) how many tokens the conditional mean averages over
     """
     sae.eval()
     n_features = sae.n_features
     d_model = sae.d_model
 
-    # Use a subset of activations for speed
-    sample_indices = np.random.choice(len(activations), min(n_samples, len(activations)), replace=False)
-    sample_acts = activations[sample_indices]
+    # Defaults to the whole eval set. Subsampling made sense when this ablated features one
+    # at a time, but the closed form below costs one matmul per batch, and using the same
+    # tokens as compute_activation_stats means a single firing floor governs every conditional
+    # statistic instead of each estimator having its own effective threshold.
+    if n_samples is None or n_samples >= len(activations):
+        sample_acts = activations
+    else:
+        sample_indices = np.random.choice(len(activations), n_samples, replace=False)
+        sample_acts = activations[sample_indices]
 
-    print(f"Computing reconstruction contributions for {n_features} features...")
+    print(f"Computing reconstruction contributions for {n_features} features "
+          f"over {len(sample_acts):,} tokens...")
 
     delta_sums = torch.zeros(n_features, dtype=torch.float64, device=device)
     active_counts = torch.zeros(n_features, dtype=torch.float64, device=device)
@@ -1512,9 +1685,10 @@ def compute_reconstruction_contribution(
     # delta is exactly zero wherever the feature did not fire, so the running sum over all
     # tokens already equals the sum over firing tokens.
     conditional = np.divide(
-        delta_sums, active_counts, out=np.zeros_like(delta_sums), where=active_counts > 0
+        delta_sums, active_counts,
+        out=np.full_like(delta_sums, np.nan), where=active_counts >= MIN_FIRINGS,
     )
-    return conditional, unconditional
+    return conditional, unconditional, active_counts
 
 def compute_encoder_stats(sae):
     """Encoder-side single-run statistics.
@@ -1528,7 +1702,7 @@ def compute_encoder_stats(sae):
     return enc.norm(dim=0).cpu().numpy(), sae.b_enc.detach().cpu().numpy()
 
 
-def compute_single_run_statistics(sae, activations, device, k=10, n_samples=10000, label=""):
+def compute_single_run_statistics(sae, activations, device, k=10, n_samples=None, label=""):
     """Every predictor available from ONE SAE, with no reference to any other seed.
 
     Returned as a dict so the same code path can produce the reference seed's statistics and
@@ -1539,12 +1713,12 @@ def compute_single_run_statistics(sae, activations, device, k=10, n_samples=1000
     isolation = compute_geometric_isolation(sae, k=k)
 
     print(f"Computing activation statistics{suffix}...")
-    freq, mean_act = compute_activation_stats(
+    freq, mean_act, counts = compute_activation_stats(
         sae, activations, device, desc=f"activation stats{suffix}"
     )
 
     print(f"Computing reconstruction contribution{suffix}...")
-    recon_cond, recon_uncond = compute_reconstruction_contribution(
+    recon_cond, recon_uncond, _ = compute_reconstruction_contribution(
         sae, activations, n_samples=n_samples, device=device
     )
 
@@ -1553,6 +1727,7 @@ def compute_single_run_statistics(sae, activations, device, k=10, n_samples=1000
     return {
         "activation_freq": freq,
         "mean_activation": mean_act,
+        "firing_counts": counts,
         "geometric_isolation": isolation,
         "recon_contribution": recon_cond,
         "recon_contribution_uncond": recon_uncond,
@@ -1566,10 +1741,9 @@ print("Computing geometric isolation...")
 geometric_isolation = compute_geometric_isolation(reference_sae, k=10)
 
 print("\nComputing reconstruction contribution...")
-recon_contribution, recon_contribution_uncond = compute_reconstruction_contribution(
+recon_contribution, recon_contribution_uncond, _ = compute_reconstruction_contribution(
     reference_sae,
     activations,
-    n_samples=10000,
     device=CONFIG["device"]
 )
 
@@ -1590,8 +1764,11 @@ for _name, _values in [
     ("encoder column norm", encoder_norm),
     ("encoder bias", encoder_bias),
 ]:
-    _rho = spearmanr(activation_freq, _values).statistic
-    print(f"  {_name:42s}: rho={_rho:+.3f}")
+    # omit rather than propagate: the conditional statistics are NaN below the firing floor,
+    # and dropping those features is exactly the comparison we want anyway.
+    _rho = spearmanr(activation_freq, _values, nan_policy="omit").statistic
+    _n = int(np.isfinite(_values).sum())
+    print(f"  {_name:42s}: rho={_rho:+.3f} (n={_n})")
 
 print("\nDone! All predictors computed.")
 
@@ -1600,17 +1777,19 @@ print("=" * 60)
 print("COMPARISON OF ALL FOUR STABILITY PREDICTORS")
 print("=" * 60)
 
+# nan-aware throughout: the conditional statistics are NaN below the MIN_FIRINGS floor, and
+# a plain mean() would turn one under-measured feature into a NaN for the whole group.
 print("\n=== Stable Features (n={}) ===".format(len(stable_indices)))
 print(f"  1. Activation freq:        mean={activation_freq[stable_indices].mean():.4f}, std={activation_freq[stable_indices].std():.4f}")
 print(f"  2. Decoder norm:           mean={decoder_norms[stable_indices].mean():.4f}, std={decoder_norms[stable_indices].std():.4f}")
 print(f"  3. Geometric isolation:    mean={geometric_isolation[stable_indices].mean():.4f}, std={geometric_isolation[stable_indices].std():.4f}")
-print(f"  4. Recon contribution:     mean={recon_contribution[stable_indices].mean():.6f}, std={recon_contribution[stable_indices].std():.6f}")
+print(f"  4. Recon contribution:     mean={np.nanmean(recon_contribution[stable_indices]):.6f}, std={np.nanstd(recon_contribution[stable_indices]):.6f}")
 
 print("\n=== Unstable Features (n={}) ===".format(len(unstable_indices)))
 print(f"  1. Activation freq:        mean={activation_freq[unstable_indices].mean():.4f}, std={activation_freq[unstable_indices].std():.4f}")
 print(f"  2. Decoder norm:           mean={decoder_norms[unstable_indices].mean():.4f}, std={decoder_norms[unstable_indices].std():.4f}")
 print(f"  3. Geometric isolation:    mean={geometric_isolation[unstable_indices].mean():.4f}, std={geometric_isolation[unstable_indices].std():.4f}")
-print(f"  4. Recon contribution:     mean={recon_contribution[unstable_indices].mean():.6f}, std={recon_contribution[unstable_indices].std():.6f}")
+print(f"  4. Recon contribution:     mean={np.nanmean(recon_contribution[unstable_indices]):.6f}, std={np.nanstd(recon_contribution[unstable_indices]):.6f}")
 
 # Compute effect sizes (difference in means / pooled std)
 print("\n=== Effect Sizes (Cohen's d) ===")
@@ -1624,9 +1803,9 @@ for name, values in [
     unstable_vals = values[unstable_indices]
 
     # Cohen's d
-    pooled_std = np.sqrt((stable_vals.std()**2 + unstable_vals.std()**2) / 2)
+    pooled_std = np.sqrt((np.nanstd(stable_vals)**2 + np.nanstd(unstable_vals)**2) / 2)
     if pooled_std > 0:
-        cohens_d = (stable_vals.mean() - unstable_vals.mean()) / pooled_std
+        cohens_d = (np.nanmean(stable_vals) - np.nanmean(unstable_vals)) / pooled_std
     else:
         cohens_d = 0
 
@@ -1660,8 +1839,28 @@ from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
 
-# Only train on features with a definite label (exclude the discarded middle)
-labeled_mask = stable_mask | unstable_mask
+# Only train on features with a definite label (exclude the discarded middle) AND enough
+# firings for their statistics to mean anything.
+#
+# The floor is not bookkeeping, it decides what the AUROC measures. A latent that never fires
+# is labelled unstable automatically -- its decoder row never moved from initialization, so no
+# feature in another seed matches it -- and it has activation frequency exactly zero, an
+# encoder bias still at its init value, and no conditional statistics at all. Leave those in
+# and the classifier scores well by detecting corpses, which is a claim about how thoroughly
+# the dictionary died, not about whether stability is predictable in advance. The first TopK
+# run was 60% dead and returned the highest AUROC of any run, 0.981, which is the symptom.
+live_mask = firing_counts >= MIN_FIRINGS
+labeled_mask = (stable_mask | unstable_mask) & live_mask
+
+_dropped = (stable_mask | unstable_mask) & ~live_mask
+print(f"\n=== Firing floor (MIN_FIRINGS={MIN_FIRINGS} over {len(activations):,} eval tokens) ===")
+print(f"  labelled features below the floor, dropped: {int(_dropped.sum())} "
+      f"({_dropped.sum() / max((stable_mask | unstable_mask).sum(), 1):.1%} of labelled)")
+print(f"    of which labelled stable:   {int((_dropped & stable_mask).sum())}")
+print(f"    of which labelled unstable: {int((_dropped & unstable_mask).sum())}")
+if _dropped.any() and (_dropped & unstable_mask).sum() / max(_dropped.sum(), 1) > 0.9:
+    print("  NOTE: the dropped features are almost entirely 'unstable', which is the "
+          "confound this floor exists to remove -- they were separable on frequency alone.")
 
 # Firing rates and activation magnitudes are heavy-tailed over several orders of magnitude,
 # and logistic regression fits a boundary that is linear in whatever it is handed. Left in
@@ -1692,6 +1891,7 @@ def build_predictors(stats):
 reference_stats = {
     "activation_freq": activation_freq,
     "mean_activation": mean_activation,
+    "firing_counts": firing_counts,
     "geometric_isolation": geometric_isolation,
     "recon_contribution": recon_contribution,
     "encoder_norm": encoder_norm,
@@ -1707,7 +1907,14 @@ X = np.column_stack([values for _, values in PREDICTORS])[labeled_mask]
 y = stable_mask[labeled_mask].astype(int)
 
 print(f"Features excluded from classifier training (discarded middle): {middle_mask.sum()}")
+print(f"Features excluded from classifier training (below firing floor): {int(_dropped.sum())}")
 print(f"Features used for classifier training: {labeled_mask.sum()}")
+if not np.isfinite(X).all():
+    raise SystemExit(
+        "Non-finite values reached the feature matrix. The firing floor is supposed to "
+        "remove every feature whose conditional statistics are NaN, so this means a "
+        "predictor is NaN for some reason other than too few firings."
+    )
 
 print(f"Feature matrix shape: {X.shape}")
 print(f"Label distribution: {y.sum()} stable, {len(y) - y.sum()} unstable")
@@ -1813,8 +2020,8 @@ else:
 
 """## 11. Does the headline number survive its own methodology choices?
 
-Three checks, each aimed at a way the AUROC above could be an artifact of a labelling
-decision rather than a property of the SAE:
+Four checks, each aimed at a way the AUROC above could be an artifact of a labelling or
+measurement decision rather than a property of the SAE:
 
   1. Endpoint binarization discards the ambiguous middle, which removes the hardest cases
      before scoring. Re-run over ALL features under p_hat >= 0.5 to size that effect.
@@ -1824,6 +2031,9 @@ decision rather than a property of the SAE:
   3. Cross-validation holds out features from the SAME dictionary, and geometric isolation
      is relational -- a feature's value depends on neighbours that may sit in the training
      fold. Train on the reference seed and test on a different seed's dictionary entirely.
+  4. Barely-firing latents are trivially separable (frequency ~0, decoder row still at
+     initialization, so nothing matches them and they are labelled unstable by default).
+     Sweep the firing floor to see how much of the headline number they were carrying.
 """
 
 print("\n" + "=" * 60)
@@ -1846,14 +2056,17 @@ X_all = np.column_stack([values for _, values in PREDICTORS])
 
 # --- 1. how much does discarding the ambiguous middle flatter the result? ---
 print("\n1. Effect of discarding the ambiguous middle")
-all_mask = np.ones(len(reappearance_probs), dtype=bool)
+# Both arms are restricted to features above the firing floor, so this isolates the effect of
+# the binarization rule. Letting the p_hat >= 0.5 arm keep the under-measured features would
+# confound the two exclusions and make the comparison unreadable.
+all_mask = live_mask.copy()
 midpoint_labels = reappearance_probs >= 0.5
 endpoint_auroc = cv_auroc(X_all, stable_mask, labeled_mask)
 midpoint_auroc = cv_auroc(X_all, midpoint_labels, all_mask)
 print(f"   endpoint only  (n={labeled_mask.sum():4d}, the reported figure): {endpoint_auroc:.3f}")
 print(f"   all features   (n={all_mask.sum():4d}, p_hat >= 0.5)           : {midpoint_auroc:.3f}")
-print(f"   inflation attributable to discarding {middle_mask.sum()} features: "
-      f"{endpoint_auroc - midpoint_auroc:+.3f}")
+print(f"   inflation attributable to discarding {int((middle_mask & live_mask).sum())} "
+      f"middle features: {endpoint_auroc - midpoint_auroc:+.3f}")
 
 # --- 2. do the labels, and isolation's power over them, depend on the matching rule? ---
 print("\n2. Effect of the matching rule (many-to-one vs one-to-one)")
@@ -1871,7 +2084,7 @@ for _other in _seeds[1:]:
 
 hungarian_probs = _hungarian_counts / max(len(_seeds) - 1, 1)
 hungarian_stable = hungarian_probs >= (1 - EPSILON)
-hungarian_labeled = hungarian_stable | (hungarian_probs <= EPSILON)
+hungarian_labeled = (hungarian_stable | (hungarian_probs <= EPSILON)) & live_mask
 
 print(f"   stable fraction  many-to-one: {stable_mask.mean():6.1%}   "
       f"one-to-one: {hungarian_stable.mean():6.1%}")
@@ -1898,13 +2111,18 @@ else:
     held_out_saes.update({s: trained_saes[s] for s in _seeds if s != held_out_seed})
     held_out_probs, _ = compute_reappearance_probability(held_out_saes, theta=THETA)
     held_out_stable = held_out_probs >= (1 - EPSILON)
-    held_out_mask = held_out_stable | (held_out_probs <= EPSILON)
 
     held_out_stats = compute_single_run_statistics(
         trained_saes[held_out_seed], activations, CONFIG["device"],
         label=f"seed {held_out_seed}",
     )
     X_held = np.column_stack([v for _, v in build_predictors(held_out_stats)])
+    # The floor has to be re-derived from THIS dictionary's firing counts: which latents are
+    # under-measured is a property of the SAE being tested, not of the one trained on.
+    held_out_live = held_out_stats["firing_counts"] >= MIN_FIRINGS
+    held_out_mask = (held_out_stable | (held_out_probs <= EPSILON)) & held_out_live
+    print(f"   held-out seed {held_out_seed}: {int(held_out_live.sum())} of "
+          f"{len(held_out_live)} latents above the firing floor")
 
     transfer_clf = LogisticRegression(class_weight="balanced", random_state=42, max_iter=1000)
     transfer_scaler = StandardScaler().fit(X_all[labeled_mask])
@@ -1919,7 +2137,7 @@ else:
     transfer_auroc = roc_auc_score(held_truth, transfer_clf.predict_proba(
         transfer_scaler.transform(X_held[held_out_mask]))[:, 1])
     refit_auroc = roc_auc_score(held_truth, transfer_clf.predict_proba(
-        StandardScaler().fit_transform(X_held)[held_out_mask])[:, 1])
+        StandardScaler().fit(X_held[held_out_live]).transform(X_held[held_out_mask]))[:, 1])
 
     print(f"   trained on seed {_seeds[0]}, tested on seed {held_out_seed} "
           f"(n={held_out_mask.sum()}, {held_truth.sum()} stable)")
@@ -1929,3 +2147,28 @@ else:
     print(f"   transfer cost (rescaled)                : {refit_auroc - endpoint_auroc:+.3f}")
     print("   (the held-out number is the one that supports 'use this on an SAE you did "
           "not train')")
+
+# --- 4. how much of the AUROC was carried by latents that barely fire? ---
+print("\n4. Sensitivity to the firing floor")
+# Undefined conditional statistics are imputed with 0.0 here, reproducing what the code did
+# before the floor existed. That imputation is the mechanism under suspicion: a never-firing
+# latent gets frequency ~0, mean activation 0, contribution 0, and is labelled unstable
+# because its untrained decoder row matches nothing, so those four values in combination
+# identify it perfectly without saying anything about predictability.
+_imputed_stats = dict(reference_stats)
+for _key in ("mean_activation", "recon_contribution"):
+    _imputed_stats[_key] = np.nan_to_num(reference_stats[_key], nan=0.0)
+X_imputed = np.column_stack([v for _, v in build_predictors(_imputed_stats)])
+
+_definite = stable_mask | unstable_mask
+print(f"   {'floor':>6}  {'n':>5}  {'% of dict':>9}  {'% stable':>8}  {'AUROC':>6}")
+for _floor in (0, 1, 10, 100, 1000):
+    _m = _definite & (firing_counts >= _floor)
+    if _m.sum() < 20 or len(np.unique(stable_mask[_m])) < 2:
+        print(f"   {_floor:>6}  {int(_m.sum()):>5}  too few features left to score")
+        continue
+    print(f"   {_floor:>6}  {int(_m.sum()):>5}  {(firing_counts >= _floor).mean():>8.1%}  "
+          f"{stable_mask[_m].mean():>7.1%}  {cv_auroc(X_imputed, stable_mask, _m):>6.3f}")
+print(f"   the reported figure uses floor={MIN_FIRINGS}. A number that falls steeply as the "
+      f"floor rises\n   was being carried by under-trained latents rather than by predictable "
+      f"structure.")

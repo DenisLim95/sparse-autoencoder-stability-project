@@ -23,7 +23,7 @@ import os
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 
 from pathlib import Path
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -34,7 +34,7 @@ SCRIPT = Path(__file__).parent / "prelim_experiments_update.py"
 lines = SCRIPT.read_text().splitlines()
 start = next(i for i, l in enumerate(lines) if l.startswith("class SparseAutoencoder"))
 end = next(i for i, l in enumerate(lines) if l.startswith('"""## 3.'))
-ns = {"torch": torch, "nn": nn, "F": F, "Tuple": Tuple}
+ns = {"torch": torch, "nn": nn, "F": F, "Tuple": Tuple, "Optional": Optional}
 exec(compile("\n".join(lines[start:end]), str(SCRIPT), "exec"), ns)
 SAE = ns["SparseAutoencoder"]
 
