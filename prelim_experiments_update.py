@@ -32,11 +32,37 @@ CONFIG = {
     "hook_point": "blocks.3.hook_resid_post",  # Middle layer of Pythia-70m (6 layers, so layer 3)
     "d_model": 512,  # Pythia-70m hidden dimension
     "n_features": 2048,  # SAE dictionary size (4x expansion)
+    # How sparsity is imposed. "l1" is the objective every checkpoint on both Hub repos was
+    # trained under; "topk" keeps exactly the k largest latents per token. The L1 arm settled
+    # at L0 ~= 345 of 2048 features, i.e. 17% of the dictionary firing on every token, far
+    # denser than published SAEs. L1 cannot target an L0 -- you sweep the coefficient and see
+    # what you get, and each probe costs a full training run. TopK fixes L0 = k by
+    # construction, which is the only affordable way to reach a defensible sparsity on a
+    # machine that gets deleted on a deadline.
+    # `or` rather than a default, so a variable set to the empty string (easy to do in a
+    # notebook when clearing a setting) reads as unset instead of crashing on int("").
+    "sparsity": os.environ.get("SAE_SPARSITY") or "l1",  # "l1" | "topk"
+    "k": int(os.environ.get("SAE_TOPK_K") or 32),  # active latents per token, TopK only
     # Every checkpoint on both Hub repos (1M through 8B, all seeds) was trained at 1.0 --
     # verified from each checkpoint's saved config and cross-checked against the recorded
     # losses. Resuming those checkpoints under a different coefficient would change the
     # objective mid-curve, so this must stay at 1.0 unless the whole sweep is retrained.
-    "l1_coeff": 1.0,  # Sparsity coefficient
+    #
+    # On units: the penalty is f.abs().mean(), which averages over the batch AND the feature
+    # dimension, while recon_loss averages over the batch and d_model. The usual convention
+    # sums over features, so in standard units this coefficient is really
+    # l1_coeff * d_model / n_features = 0.25 -- which is why 1.0 looks nothing like the ~1e-3
+    # in the literature. Do not switch the penalty to a sum without retraining the whole
+    # sweep, as that changes the objective every existing checkpoint was trained under. The
+    # side effect worth remembering: effective pressure scales as 1/n_features, so raising
+    # the dictionary size silently weakens sparsity too.
+    "l1_coeff": 1.0,  # Sparsity coefficient, L1 only
+    # L1 needs a unit-norm decoder or the penalty is gamed by shrinking the encoder and
+    # inflating the decoder, which is why decoder norm measured identically 1.000 with zero
+    # variance and therefore zero predictive value. TopK has no such term to game, so setting
+    # this False under TopK makes decoder norm a live predictor again. It changes two things
+    # at once though, so leave it True for the first L1-vs-TopK comparison.
+    "normalize_decoder": os.environ.get("SAE_NORMALIZE_DECODER", "1") != "0",
     "lr": 1e-3,
     "batch_size": 256,
     "seq_len": 128,
@@ -52,6 +78,20 @@ CONFIG = {
 
 print(f"Using device: {CONFIG['device']}")
 print(f"Training seeds: {CONFIG['seeds']}")
+if CONFIG["sparsity"] == "topk":
+    print(f"Objective: TopK, k={CONFIG['k']} (L0 is exactly k by construction)")
+elif CONFIG["sparsity"] == "l1":
+    _lambda_std = CONFIG["l1_coeff"] * CONFIG["d_model"] / CONFIG["n_features"]
+    print(f"Objective: L1, l1_coeff={CONFIG['l1_coeff']:g} "
+          f"(= {_lambda_std:g} in sum-over-features units)")
+else:
+    raise SystemExit(f"Unknown CONFIG['sparsity']={CONFIG['sparsity']!r}; use 'l1' or 'topk'.")
+if not CONFIG["normalize_decoder"] and CONFIG["sparsity"] == "l1":
+    raise SystemExit(
+        "normalize_decoder=False with the L1 objective: the penalty is then trivially gamed "
+        "by shrinking the encoder and inflating the decoder, so the run would drift to a "
+        "meaningless solution. Unit-norm decoders are only optional under TopK."
+    )
 
 # Token budgets at which an SAE checkpoint is saved, so stability can be compared
 # across training scale. Roughly geometric: on a leased machine that gets deleted on a
@@ -69,6 +109,19 @@ CHECKPOINT_TOKENS = [
     5_000_000_000,
     8_000_000_000,
 ]
+
+# Cap the run below the full curve, e.g. SAE_MAX_TOKENS=100000000 to stop at the 100M
+# milestone. The TopK arm only needs comparing against the L1 checkpoints at one matched
+# budget, so training it out to 8B would spend days of GPU time answering nothing extra.
+_max_tokens = int(os.environ.get("SAE_MAX_TOKENS") or 0)
+if _max_tokens:
+    _capped = [t for t in CHECKPOINT_TOKENS if t <= _max_tokens]
+    if not _capped:
+        raise SystemExit(
+            f"SAE_MAX_TOKENS={_max_tokens:,} is below the first milestone "
+            f"({min(CHECKPOINT_TOKENS):,}), so there would be nothing to checkpoint."
+        )
+    CHECKPOINT_TOKENS = _capped
 
 # Read-only repo to seed checkpoints from, e.g. SAE_SEED_REPO=ndasari/SAE_project. Lets a run
 # start from a collaborator's completed milestones; never uploaded to, so their repo is safe.
@@ -108,7 +161,23 @@ else:
         RESULTS_BASE = "outputs"
 
 _layer = CONFIG["hook_point"].split(".")[1]
-RUN_NAME = f"{CONFIG['model_name']}_L{_layer}_{max(CHECKPOINT_TOKENS) // 1_000_000_000}Btok"
+
+
+def _token_label(n: int) -> str:
+    return f"{n // 1_000_000_000}B" if n >= 1_000_000_000 else f"{n // 1_000_000}M"
+
+
+# The default full-curve L1 run keeps its original directory name byte-for-byte, so the 1M-8B
+# checkpoints already on both Hub repos still resolve. Anything that changes the objective
+# gets a suffix, which also stops two incomparable families of checkpoints being written into
+# the same directory and silently resumed from each other.
+_objective_tag = "" if CONFIG["sparsity"] == "l1" else f"_topk{CONFIG['k']}"
+if not CONFIG["normalize_decoder"]:
+    _objective_tag += "_freedec"
+RUN_NAME = (
+    f"{CONFIG['model_name']}_L{_layer}"
+    f"_{_token_label(max(CHECKPOINT_TOKENS))}tok{_objective_tag}"
+)
 OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -202,19 +271,27 @@ def activation_stream_generator(model, dataset_name: str, hook_point: str, seq_l
 
 class SparseAutoencoder(nn.Module):
     """
-    Standard Sparse Autoencoder with ReLU activation and L1 sparsity penalty.
+    Sparse Autoencoder with either an L1 penalty or a TopK activation.
 
     Architecture:
-        encoder: x -> ReLU(W_enc @ (x - b_dec) + b_enc)
+        encoder: x -> ReLU(W_enc @ (x - b_dec) + b_enc)      [sparsity="l1"]
+                 x -> ReLU(TopK_k(W_enc @ (x - b_dec) + b_enc))  [sparsity="topk"]
         decoder: f -> W_dec @ f + b_dec
+
+    Under "l1" sparsity is a soft penalty added to the loss and the resulting L0 is whatever
+    the coefficient happens to produce. Under "topk" at most k latents are non-zero by
+    construction and no sparsity term enters the loss at all.
     """
 
-    def __init__(self, d_model: int, n_features: int, seed: int):
+    def __init__(self, d_model: int, n_features: int, seed: int,
+                 sparsity: str = "l1", k: int = 32):
         super().__init__()
         torch.manual_seed(seed)
 
         self.d_model = d_model
         self.n_features = n_features
+        self.sparsity = sparsity
+        self.k = min(k, n_features)
 
         # Encoder weights and bias
         self.W_enc = nn.Parameter(torch.randn(d_model, n_features) * 0.01)
@@ -232,6 +309,13 @@ class SparseAutoencoder(nn.Module):
         """Encode input to sparse feature activations."""
         x_centered = x - self.b_dec
         pre_acts = x_centered @ self.W_enc + self.b_enc
+        if self.sparsity == "topk":
+            # Select on the pre-activations, then rectify. Taking the top k of an already
+            # rectified vector would pick arbitrary features out of the zeros whenever fewer
+            # than k are positive, inventing activations that carry no signal.
+            idx = pre_acts.topk(self.k, dim=-1).indices
+            keep = torch.zeros_like(pre_acts, dtype=torch.bool).scatter_(-1, idx, True)
+            pre_acts = torch.where(keep, pre_acts, torch.zeros_like(pre_acts))
         return F.relu(pre_acts)
 
     def decode(self, f: torch.Tensor) -> torch.Tensor:
@@ -253,7 +337,10 @@ class SparseAutoencoder(nn.Module):
         # Reconstruction loss (MSE)
         recon_loss = F.mse_loss(x_hat, x)
 
-        # Sparsity loss (L1 on feature activations)
+        # L1 magnitude of the code. Always reported so the training curves stay comparable
+        # across objectives, but only added to the loss when sparsity="l1" -- under TopK the
+        # constraint is structural and penalising magnitude on top of it would just shrink
+        # the k surviving activations.
         sparsity_loss = f.abs().mean()
 
         return x_hat, f, {"recon_loss": recon_loss, "sparsity_loss": sparsity_loss}
@@ -451,7 +538,10 @@ def train_saes_shared_stream(
 
     # Each __init__ reseeds the RNG before drawing, so construction order doesn't matter.
     saes = {
-        s: SparseAutoencoder(config["d_model"], config["n_features"], seed=s).to(device)
+        s: SparseAutoencoder(
+            config["d_model"], config["n_features"], seed=s,
+            sparsity=config["sparsity"], k=config["k"],
+        ).to(device)
         for s in seeds
     }
     optimizers = {s: torch.optim.Adam(saes[s].parameters(), lr=config["lr"]) for s in seeds}
@@ -494,13 +584,29 @@ def train_saes_shared_stream(
         # Resuming under a different objective than the checkpoints were trained with would
         # silently put a discontinuity in the middle of the scaling curve, and nothing
         # downstream could detect it. Refuse rather than produce unattributable numbers.
-        prior_l1 = resume.get("config", {}).get("l1_coeff")
-        if prior_l1 is not None and prior_l1 != config["l1_coeff"]:
+        prior = resume.get("config", {})
+        # Checkpoints written before the sparsity flag existed are all L1, so absence means
+        # "l1" rather than "unknown" -- treating it as unknown would let a TopK run silently
+        # resume from L1 weights.
+        prior_sparsity = prior.get("sparsity", "l1")
+        mismatches = []
+        if prior_sparsity != config["sparsity"]:
+            mismatches.append(("sparsity", prior_sparsity, config["sparsity"]))
+        elif prior_sparsity == "topk":
+            if prior.get("k") is not None and prior["k"] != config["k"]:
+                mismatches.append(("k", prior["k"], config["k"]))
+        elif prior.get("l1_coeff") is not None and prior["l1_coeff"] != config["l1_coeff"]:
+            mismatches.append(("l1_coeff", prior["l1_coeff"], config["l1_coeff"]))
+        prior_norm = prior.get("normalize_decoder", True)
+        if prior_norm != config["normalize_decoder"]:
+            mismatches.append(("normalize_decoder", prior_norm, config["normalize_decoder"]))
+        if mismatches:
+            detail = "; ".join(f"{k}: checkpoint={p!r} vs CONFIG={c!r}" for k, p, c in mismatches)
             raise SystemExit(
-                f"Refusing to resume: checkpoints were trained with l1_coeff={prior_l1:g} but "
-                f"CONFIG has l1_coeff={config['l1_coeff']:g}. Continuing would change the "
-                f"objective mid-run. Set CONFIG['l1_coeff'] to {prior_l1:g}, or train from "
-                f"scratch into an empty checkpoint directory."
+                f"Refusing to resume, the objective would change mid-run ({detail}). Either "
+                f"match CONFIG to the checkpoints, or train from scratch into an empty "
+                f"checkpoint directory -- each objective gets its own directory, so this "
+                f"usually means two runs were pointed at the same one."
             )
         for s in seeds:
             saes[s].load_state_dict(resume["models"][s])
@@ -554,20 +660,27 @@ def train_saes_shared_stream(
             with open(checkpoint_dir.parent / f"training_history_seed{s}.json", "w") as fh:
                 json.dump(histories[s], fh)
 
+    # Zero under TopK, where sparsity is structural rather than penalised. Kept as a weight
+    # rather than a branch so the loss and the logged l1_term cannot disagree about it.
+    l1_weight = config["l1_coeff"] if config["sparsity"] == "l1" else 0.0
+    unit_norm_decoder = config["normalize_decoder"]
+
     for batch in activation_stream:
         batch = batch.to(device, non_blocking=True)
 
         for s in seeds:
             sae, optimizer = saes[s], optimizers[s]
             x_hat, f, loss_dict = sae(batch)
-            loss = loss_dict["recon_loss"] + config["l1_coeff"] * loss_dict["sparsity_loss"]
+            loss = loss_dict["recon_loss"] + l1_weight * loss_dict["sparsity_loss"]
 
             optimizer.zero_grad()
             loss.backward()
-            with torch.no_grad():
-                sae.W_dec.grad = remove_parallel_component(sae.W_dec.data, sae.W_dec.grad)
+            if unit_norm_decoder:
+                with torch.no_grad():
+                    sae.W_dec.grad = remove_parallel_component(sae.W_dec.data, sae.W_dec.grad)
             optimizer.step()
-            sae.normalize_decoder()
+            if unit_norm_decoder:
+                sae.normalize_decoder()
 
             with torch.no_grad():
                 active = f > 0
@@ -594,7 +707,7 @@ def train_saes_shared_stream(
                 h["tokens_seen"].append(tokens_seen)
                 h["recon_loss"].append(recon)
                 h["sparsity_loss"].append(sparsity)
-                h["l1_term"].append(config["l1_coeff"] * sparsity)
+                h["l1_term"].append(l1_weight * sparsity)
                 h["total_loss"].append(total)
                 h["l0"].append(l0)
                 # Dead = never fired anywhere in this logging window.
@@ -608,9 +721,13 @@ def train_saes_shared_stream(
             interval_n = 0
             worst_dead = max(100 * histories[s]["dead_frac"][-1] for s in seeds)
             mean_sparsity = np.mean([histories[s]["sparsity_loss"][-1] for s in seeds])
+            # Under TopK the penalty is not in the loss, so reporting a weighted term would
+            # be a column of zeros; show the raw code magnitude instead.
+            sparsity_col = (f"l1_term {l1_weight * mean_sparsity:.5f}" if l1_weight
+                            else f"|f|_1 {mean_sparsity:.5f}")
             print(f"step {step:>7} | {tokens_seen:>14,} tok | "
                   f"recon {np.mean(recons):.5f} | "
-                  f"l1_term {config['l1_coeff'] * mean_sparsity:.5f} | "
+                  f"{sparsity_col} | "
                   f"L0 {np.mean(l0s):6.1f} ({min(l0s):.0f}-{max(l0s):.0f}) | "
                   f"dead {worst_dead:5.1f}%")
 
@@ -670,14 +787,19 @@ trained_saes, training_histories = train_saes_shared_stream(
 print(f"\nTrained {len(trained_saes)} SAEs with seeds: {list(trained_saes.keys())}")
 print(f"Checkpoints saved at token counts: {CHECKPOINT_TOKENS}")
 
-"""### 3b. Training curves — is l1_coeff too large?
+"""### 3b. Training curves — did the sparsity setting land somewhere usable?
 
-`l1_coeff` is 1.0 here, three orders of magnitude above the 1e-3 used for the earlier
-1M/10M runs, so these curves are the check on whether the sparsity penalty is dominating.
-The warning signs, in order of how conclusive they are: the dead-feature fraction climbing
-toward 100%, L0 collapsing toward 0, and the weighted L1 term sitting far above the
-reconstruction term. Any of those means most features are being pushed to zero and the SAE
-is buying sparsity at the cost of reconstructing anything.
+Under the L1 objective the question is whether the penalty is dominating. The warning signs,
+in order of how conclusive they are: the dead-feature fraction climbing toward 100%, L0
+collapsing toward 0, and the weighted L1 term sitting far above the reconstruction term. Any
+of those means most features are being pushed to zero and the SAE is buying sparsity at the
+cost of reconstructing anything. Note that `l1_coeff = 1.0` is not comparable to the ~1e-3
+quoted in papers: the penalty here is averaged over features rather than summed, so in the
+usual units it is `l1_coeff * d_model / n_features = 0.25`.
+
+Under TopK there is no coefficient to get wrong, because L0 is exactly k. The failure mode
+moves to dead features, which TopK strands far more readily than L1 does, and which corrupt
+the stability analysis rather than merely wasting capacity — see the diagnostic below.
 """
 
 
@@ -702,13 +824,22 @@ def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_pat
     anchor_seed = list(histories.keys())[0]
     h = histories[anchor_seed]
     axes[0, 1].plot(h["tokens_seen"], h["recon_loss"], label="reconstruction")
-    axes[0, 1].plot(h["tokens_seen"], h["l1_term"], label=f"l1_coeff x L1 ({config['l1_coeff']:g})")
+    if config["sparsity"] == "topk":
+        # l1_term is identically zero under TopK and would plot as nothing on a log axis.
+        axes[0, 1].plot(h["tokens_seen"], h["sparsity_loss"], label="mean |f| (unpenalized)")
+        axes[0, 1].set_title(f"Reconstruction vs code magnitude (seed {anchor_seed})")
+    else:
+        axes[0, 1].plot(h["tokens_seen"], h["l1_term"],
+                        label=f"l1_coeff x L1 ({config['l1_coeff']:g})")
+        axes[0, 1].set_title(f"Loss terms compared (seed {anchor_seed})")
     axes[0, 1].set_yscale("log")
     axes[0, 1].set_ylabel("Loss term")
-    axes[0, 1].set_title(f"Loss terms compared (seed {anchor_seed})")
 
     axes[1, 0].set_ylabel("L0 (mean active features/token)")
-    axes[1, 0].set_title("Sparsity: L0 -> 0 means over-penalized")
+    axes[1, 0].set_title(
+        f"Sparsity: L0 should sit at k={config['k']}" if config["sparsity"] == "topk"
+        else "Sparsity: L0 -> 0 means over-penalized"
+    )
 
     axes[1, 1].set_ylabel("Dead features (%)")
     axes[1, 1].set_ylim(0, 100)
@@ -723,6 +854,28 @@ def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_pat
         plt.savefig(save_path, dpi=150)
         print(f"Saved training curves to {save_path}")
     plt.show()
+
+    if config["sparsity"] == "topk":
+        print(f"\n=== TopK k={config['k']} diagnostic (final logging window) ===")
+        for seed, h in histories.items():
+            print(f"  seed {seed}: L0={h['l0'][-1]:.1f} (target {config['k']}), "
+                  f"dead={100 * h['dead_frac'][-1]:.1f}%, recon={h['recon_loss'][-1]:.5f}")
+        worst_dead = max(100 * h["dead_frac"][-1] for h in histories.values())
+        if worst_dead > 20:
+            live = config["n_features"] * (1 - worst_dead / 100)
+            print(f"\n  WARNING: up to {worst_dead:.1f}% of features never fired in the last "
+                  f"logging window, leaving about {live:.0f} of {config['n_features']} live. "
+                  f"TopK strands latents this way, which is why the published recipe adds an "
+                  f"auxiliary revival loss. This matters for the result and not just for "
+                  f"capacity: a dead feature's decoder row stays near initialization, so "
+                  f"nothing matches it and it is labelled unstable, while its activation "
+                  f"frequency is exactly zero. The classifier can then separate the classes "
+                  f"by detecting dead features, inflating AUROC while learning nothing about "
+                  f"real ones. Exclude never-firing features before trusting the number.")
+        else:
+            print(f"\n  Dead fraction at most {worst_dead:.1f}%; the dictionary is in use and "
+                  f"L0 is pinned at k by construction, so there is no sparsity to tune.")
+        return
 
     print(f"\n=== l1_coeff = {config['l1_coeff']:g} diagnostic (final logging window) ===")
     for seed, h in histories.items():
