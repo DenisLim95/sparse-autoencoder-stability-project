@@ -142,26 +142,45 @@ if not CONFIG["tied_init"] or CONFIG["auxk_coeff"] == 0:
     print("  WARNING: the unmitigated TopK run reached 60% dead latents and produced an "
           "AUROC of 0.981 that was measuring dead features, not stability.")
 
-# Token budgets at which a checkpoint is saved, so stability can be compared across training
-# scale. Roughly geometric: on a leased machine that gets deleted on a deadline, each
-# milestone is a complete, analyzable result banked early, so a run cut short still yields a
-# curve instead of nothing.
-CHECKPOINT_TOKENS = [
+# Token budgets at which a checkpoint is saved. Each milestone is a complete, analyzable
+# result banked early, so a run cut short still yields a scaling curve instead of nothing --
+# and since only milestones are mirrored to the Hub, the spacing is also the worst-case loss
+# when a machine dies mid-leg.
+#
+# Denser above 100M than the L1 script's grid, which jumped 100M -> 1B -> 2B. At the observed
+# throughput each 500M leg is a couple of hours, so that is the exposure; the L1 grid's 900M
+# gap was most of a working day. The extra milestones also add points to the stability-vs-
+# tokens curve, which is the measurement that motivates training this far in the first place.
+# Overriding with SAE_CHECKPOINT_TOKENS accepts a comma-separated list of raw token counts.
+DEFAULT_CHECKPOINT_TOKENS = [
     1_000_000,
     50_000_000,
     100_000_000,
+    250_000_000,
+    500_000_000,
     1_000_000_000,
+    1_500_000_000,
     2_000_000_000,
+    2_500_000_000,
     3_000_000_000,
     5_000_000_000,
     8_000_000_000,
 ]
+if os.environ.get("SAE_CHECKPOINT_TOKENS"):
+    CHECKPOINT_TOKENS = sorted({
+        int(t) for t in os.environ["SAE_CHECKPOINT_TOKENS"].split(",") if t.strip()
+    })
+    if not CHECKPOINT_TOKENS:
+        raise SystemExit("SAE_CHECKPOINT_TOKENS is set but empty.")
+else:
+    CHECKPOINT_TOKENS = list(DEFAULT_CHECKPOINT_TOKENS)
 
 # Unlike the L1 script this defaults to a cap rather than the full curve. Three arms at 16x
 # expansion is ~12x the SAE work per seed of the 4x single-arm run, and the question this
 # sweep exists to answer -- which k gives a defensible sparsity without killing the
-# dictionary -- is legible long before 8B tokens. Raise or clear SAE_MAX_TOKENS once k is
-# chosen and the scaling curve is what is wanted.
+# dictionary -- is legible long before 8B tokens. Raise it once k is chosen and the scaling
+# curve is what is wanted; the run directory does not depend on the cap, so raising it later
+# continues from the milestones already on disk.
 _max_tokens = int(os.environ.get("SAE_MAX_TOKENS") or 100_000_000)
 if _max_tokens:
     _capped = [t for t in CHECKPOINT_TOKENS if t <= _max_tokens]
@@ -172,7 +191,8 @@ if _max_tokens:
         )
     CHECKPOINT_TOKENS = _capped
 print(f"Token budget: up to {max(CHECKPOINT_TOKENS):,} "
-      f"(milestones {[t for t in CHECKPOINT_TOKENS]})")
+      f"({len(CHECKPOINT_TOKENS)} milestones: "
+      f"{', '.join(f'{t:,}' for t in CHECKPOINT_TOKENS)})")
 
 # Read-only repo to seed checkpoints from. Nothing on either existing Hub repo matches this
 # configuration, so this only does anything once a sweep of this shape has been uploaded.
@@ -198,17 +218,17 @@ else:
 
 _layer = CONFIG["hook_point"].split(".")[1]
 
-
-def _token_label(n: int) -> str:
-    return f"{n // 1_000_000_000}B" if n >= 1_000_000_000 else f"{n // 1_000_000}M"
-
-
 # Every axis that changes the objective is in the directory name. The L1 checkpoints live
 # under a name without any of these suffixes, so this run can neither resume from them nor
 # overwrite them -- two incomparable families of weights sharing a directory is a
 # configuration mistake that otherwise presents as a crash mid-run.
+#
+# The token budget is deliberately NOT in the name. It is a stopping point rather than a
+# property of the objective, and including it meant that analyzing an already-banked milestone
+# -- by lowering SAE_MAX_TOKENS -- pointed the script at an empty directory and forced a
+# re-download of every checkpoint from the Hub.
 _objective_tag = (
-    f"_topk{'-'.join(str(k) for k in K_VALUES)}"
+    f"topk{'-'.join(str(k) for k in K_VALUES)}"
     f"_x{CONFIG['expansion_factor']}"
 )
 if not CONFIG["normalize_decoder"]:
@@ -217,15 +237,11 @@ if CONFIG["tied_init"]:
     _objective_tag += "_tied"
 if CONFIG["auxk_coeff"]:
     _objective_tag += "_auxk"
-RUN_NAME = (
-    f"{CONFIG['model_name']}_L{_layer}"
-    f"_{_token_label(max(CHECKPOINT_TOKENS))}tok{_objective_tag}"
-)
+RUN_NAME = f"{CONFIG['model_name']}_L{_layer}_{_objective_tag}"
 OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
 
-_hub_scope = f"/{_objective_tag.lstrip('_')}"
-HUB_CHECKPOINT_PREFIX = f"checkpoints{_hub_scope}"
-HUB_RESULTS_PREFIX = f"results{_hub_scope}"
+HUB_CHECKPOINT_PREFIX = f"checkpoints/{_objective_tag}"
+HUB_RESULTS_PREFIX = f"results/{_objective_tag}"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
