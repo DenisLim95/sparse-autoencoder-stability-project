@@ -701,9 +701,32 @@ def train_arms_shared_stream(
         from huggingface_hub import HfApi
         hf_api = HfApi()
         # upload_file does not create the repo, so without this every mirror would fail
-        # with a warning and the run would silently persist nothing off-box. Fail loudly
-        # here instead: if the mirror cannot work, better to know before training starts.
+        # with a warning and the run would silently persist nothing off-box.
         hf_api.create_repo(hf_repo_id, repo_type="model", private=True, exist_ok=True)
+        # create_repo(exist_ok=True) succeeds against an existing repo the token cannot
+        # write to, so it does not establish that mirroring works -- a read-only token
+        # gets through here and then fails on every upload. Probing with a real write
+        # does establish it, and doing so before training costs a second instead of
+        # discovering at the first milestone that nothing has been persisted.
+        try:
+            hf_api.upload_file(
+                path_or_fileobj=b"write probe\n",
+                path_in_repo=f"{hub_checkpoint_prefix}/.write_probe",
+                repo_id=hf_repo_id,
+                repo_type="model",
+            )
+        except Exception as e:
+            raise SystemExit(
+                f"SAE_HF_REPO is set to {hf_repo_id!r} but this token cannot write to it, "
+                f"so checkpoints would exist only on this machine's disk:\n  {e}\n"
+                f"Fix one of:\n"
+                f"  - authenticate with a token that has WRITE access to that repo. Note "
+                f"HF_HOME={os.environ.get('HF_HOME', '~/.cache/huggingface')} decides where "
+                f"the login token is read from, so `huggingface-cli login` must run with the "
+                f"same HF_HOME as this process.\n"
+                f"  - point SAE_HF_REPO at a repo you own; it will be created private.\n"
+                f"  - unset SAE_HF_REPO to accept local-only checkpoints deliberately."
+            )
         restore_checkpoints_from_hub(
             hf_repo_id, checkpoint_dir, k_values, seeds, prefix=hub_checkpoint_prefix
         )
@@ -715,9 +738,11 @@ def train_arms_shared_stream(
             seed_repo_id, checkpoint_dir, k_values, seeds, prefix=hub_checkpoint_prefix
         )
 
-    def mirror_to_hub(path: Path, path_in_repo: str):
+    def mirror_to_hub(path: Path, path_in_repo: str) -> bool:
+        """Upload one file, returning whether it landed. Never raises: the local copy is
+        already written, so a failed push can be retried rather than ending the run."""
         if hf_api is None:
-            return
+            return False
         try:
             hf_api.upload_file(
                 path_or_fileobj=str(path),
@@ -725,10 +750,10 @@ def train_arms_shared_stream(
                 repo_id=hf_repo_id,
                 repo_type="model",
             )
+            return True
         except Exception as e:
-            # Don't let an upload failure kill the training run -- the local copy is
-            # already saved, so the push can be retried later.
             print(f"WARNING: HF upload of {path.name} failed ({e}); local copy is safe.")
+            return False
 
     resume = load_shared_resume_state(
         checkpoint_dir, arms, k_values, seeds, checkpoint_tokens
@@ -906,11 +931,12 @@ def train_arms_shared_stream(
         if (next_checkpoint_idx < len(checkpoint_tokens)
                 and tokens_seen >= checkpoint_tokens[next_checkpoint_idx]):
             milestone = checkpoint_tokens[next_checkpoint_idx]
+            uploaded = 0
             for a in arms:
                 ckpt_name = milestone_filename(a[0], a[1], milestone)
                 ckpt_path = checkpoint_dir / ckpt_name
                 save_checkpoint_atomic(build_arm_state(a), ckpt_path)
-                mirror_to_hub(ckpt_path, f"{hub_checkpoint_prefix}/{ckpt_name}")
+                uploaded += mirror_to_hub(ckpt_path, f"{hub_checkpoint_prefix}/{ckpt_name}")
 
             save_checkpoint_atomic(
                 build_shared_state(),
@@ -921,9 +947,20 @@ def train_arms_shared_stream(
                 name = f"training_history_{arm_tag(*a)}.json"
                 mirror_to_hub(checkpoint_dir.parent / name, f"{hub_results_prefix}/{name}")
 
+            # Reports what actually landed rather than that mirroring was attempted. The
+            # earlier wording claimed success unconditionally, so a milestone whose nine
+            # uploads all failed still read as "mirrored" to anyone skimming the log.
+            if hf_api is None:
+                mirror_note = " (local only, SAE_HF_REPO unset)"
+            elif uploaded == len(arms):
+                mirror_note = f", all {uploaded} mirrored to hf.co/{hf_repo_id}"
+            else:
+                mirror_note = (
+                    f", but only {uploaded} of {len(arms)} reached "
+                    f"hf.co/{hf_repo_id} -- THE REST EXIST ONLY ON THIS MACHINE"
+                )
             print(f"milestone reached: all {len(arms)} arms checkpointed at "
-                  f"{milestone:,} tokens"
-                  + (f", mirrored to hf.co/{hf_repo_id}" if hf_api is not None else ""))
+                  f"{milestone:,} tokens{mirror_note}")
             next_checkpoint_idx += 1
 
         if next_checkpoint_idx >= len(checkpoint_tokens):
