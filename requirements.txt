@@ -13,6 +13,13 @@ transformers
 datasets
 huggingface_hub
 
+# The Pile shards are .jsonl.zst, and fsspec only registers the zstd codec when this import
+# succeeds. Without it, streaming the dataset dies on "Compression type zstd not supported"
+# from inside the producer thread -- after the model has loaded, so it looks like a training
+# failure rather than a missing package. Colab ships it preinstalled, which is why the earlier
+# runs never needed it listed.
+zstandard
+
 numpy
 pandas
 scipy
