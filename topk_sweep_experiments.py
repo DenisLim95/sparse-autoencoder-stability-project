@@ -1927,3 +1927,7 @@ with open(OUTPUT_DIR / "config.json", "w") as fh:
 
 print(f"\nSaved sweep_summary.csv, sweep_summary.json, sweep_comparison.png and config.json "
       f"to {OUTPUT_DIR}")
+# Stable last line for notify_watch.sh: a watcher attached to a log cannot read the exit code
+# of a process it does not own, so a clean finish has to be recognisable from the log alone.
+# Without a sentinel it would have to key off incidental wording above and page on success.
+print("SWEEP COMPLETE")
