@@ -68,6 +68,52 @@ heartbeat() {
     curl -fsS --max-time 10 "$ALERT_HEARTBEAT_URL" >/dev/null 2>&1 || true
 }
 
+# Proves each transport end-to-end before the watch loop starts. An unset variable or a
+# blocked egress otherwise looks identical to a healthy run -- alerts print locally, nothing
+# arrives on the phone, and the first thing anyone notices is a missed crash hours later.
+preflight() {
+    local configured=0
+
+    if [[ -n "${ALERT_NTFY_TOPIC:-}" ]]; then
+        configured=1
+        local status
+        status="$(curl -sS -o /tmp/ntfy_preflight.$$ -w '%{http_code}' --max-time 15 \
+            -H "Title: alerts wired up" \
+            -d "Watcher starting on $HOST. If you can read this, notifications work." \
+            "https://ntfy.sh/${ALERT_NTFY_TOPIC}" 2>&1)"
+        if [[ "$status" == "200" ]]; then
+            echo "  ntfy      OK   -> topic '${ALERT_NTFY_TOPIC}' (check your phone now)"
+        else
+            echo "  ntfy      FAIL -> HTTP ${status:-no response}: $(head -c 200 /tmp/ntfy_preflight.$$ 2>/dev/null)"
+            echo "                   If this is a timeout, the pod's egress may block ntfy.sh."
+        fi
+        rm -f /tmp/ntfy_preflight.$$
+        [[ -n "${ALERT_EMAIL:-}" ]] && echo "  email     -> $ALERT_EMAIL (via ntfy, rate-limited)"
+    fi
+
+    if [[ -n "${ALERT_WEBHOOK_URL:-}" ]]; then
+        configured=1
+        notify "alerts wired up" "Watcher starting on $HOST." low
+        echo "  webhook   -> posted (check the channel)"
+    fi
+
+    if [[ -n "${ALERT_HEARTBEAT_URL:-}" ]]; then
+        configured=1
+        if curl -fsS --max-time 10 "$ALERT_HEARTBEAT_URL" >/dev/null 2>&1; then
+            echo "  heartbeat OK   -> will ping every ${POLL_SECONDS}s"
+        else
+            echo "  heartbeat FAIL -> ping URL unreachable"
+        fi
+    fi
+
+    if (( ! configured )); then
+        echo "  NONE. Alerts will only print in this terminal, which defeats the purpose."
+        echo "  Set ALERT_NTFY_TOPIC (and optionally ALERT_EMAIL) in THIS shell, then rerun:"
+        echo "    export ALERT_NTFY_TOPIC=your-topic-name"
+        echo "  Note that exports do not reach a tmux window that was created earlier."
+    fi
+}
+
 running() {
     if [[ -n "$WATCH_PID" ]]; then
         kill -0 "$WATCH_PID" 2>/dev/null
@@ -89,10 +135,11 @@ last_step_line="$(grep -a '^step ' "$LOG_FILE" 2>/dev/null | tail -n 1)"
 last_progress_at="$(date +%s)"
 stall_reported=0
 
-notify "watching run" \
-    "log: $LOG_FILE
-progress: ${last_step_line:-<no step lines yet>}
-alerting on: crash, ${STALL_MINUTES}m stall, upload failures, milestones" low
+echo "Watching $LOG_FILE"
+echo "  progress: ${last_step_line:-<no step lines yet>}"
+echo "  alerting on: crash, ${STALL_MINUTES}m stall, upload failures, milestones"
+echo "Transports:"
+preflight
 
 while true; do
     sleep "$POLL_SECONDS"
