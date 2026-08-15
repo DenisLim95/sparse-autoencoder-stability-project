@@ -15,9 +15,6 @@ EPSILON = 0.05   # endpoint binarization
 
 
 class SparseAutoencoder(nn.Module):
-    """Must match the architecture in prelim_experiments.py exactly, since we're
-    loading state dicts saved by that script."""
-
     def __init__(self, d_model: int, n_features: int, seed: int):
         super().__init__()
         torch.manual_seed(seed)
@@ -31,11 +28,6 @@ class SparseAutoencoder(nn.Module):
             self.W_dec.data = F.normalize(self.W_dec.data, dim=1)
 
     def encode(self, x):
-        # NOTE: this is unused by the stability analysis below (which only
-        # reads W_dec), but if you reuse this class elsewhere for inference
-        # under TopK, this ReLU-only encode() does NOT enforce the hard
-        # top-k mask — you'd need to add that here to match training-time
-        # behavior.
         return F.relu((x - self.b_dec) @ self.W_enc + self.b_enc)
 
     def decode(self, f):
