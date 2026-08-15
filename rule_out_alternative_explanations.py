@@ -1,275 +1,151 @@
-{
-  "cells": [
-    {
-      "cell_type": "code",
-      "execution_count": null,
-      "id": "8d5a4439",
-      "metadata": {},
-      "outputs": [
-        {
-          "name": "stdout",
-          "output_type": "stream",
-          "text": [
-            "Found 54 checkpoints.\n",
-            "\n",
-            "====================================================================================================\n",
-            "Structural diagnostics: dead-feature and near-duplicate-feature rates\n",
-            "====================================================================================================\n",
-            "    k        tokens   seed    %dead  %near-dup  mean max-sim\n",
-            "   64    50,000,000     42     0.0%       0.0%        0.2363\n",
-            "   64    50,000,000    256     0.0%       0.0%        0.2349\n",
-            "   64    50,000,000   1024     0.0%       0.0%        0.2344\n",
-            "   64   100,000,000     42     0.0%       0.0%        0.2558\n",
-            "   64   100,000,000    256     0.0%       0.0%        0.2563\n",
-            "   64   100,000,000   1024     0.0%       0.0%        0.2539\n",
-            "   64   250,000,000     42     0.0%       0.0%        0.2939\n",
-            "   64   250,000,000    256     0.0%       0.0%        0.2958\n",
-            "   64   250,000,000   1024     0.0%       0.0%        0.2945\n",
-            "   64   500,000,000     42     0.0%       0.0%        0.3173\n",
-            "   64   500,000,000    256     0.0%       0.0%        0.3185\n",
-            "   64   500,000,000   1024     0.0%       0.0%        0.3179\n",
-            "   64   800,000,000     42     0.0%       0.0%        0.3243\n",
-            "   64   800,000,000    256     0.0%       0.0%        0.3260\n",
-            "   64   800,000,000   1024     0.0%       0.0%        0.3252\n",
-            "   64 1,000,000,000     42     0.0%       0.0%        0.3270\n",
-            "   64 1,000,000,000    256     0.0%       0.0%        0.3293\n",
-            "   64 1,000,000,000   1024     0.0%       0.0%        0.3292\n",
-            "  128    50,000,000     42     0.0%       0.0%        0.1984\n",
-            "  128    50,000,000    256     0.0%       0.0%        0.1987\n",
-            "  128    50,000,000   1024     0.0%       0.0%        0.1987\n",
-            "  128   100,000,000     42     0.0%       0.0%        0.2205\n",
-            "  128   100,000,000    256     0.0%       0.0%        0.2198\n",
-            "  128   100,000,000   1024     0.0%       0.0%        0.2203\n",
-            "  128   250,000,000     42     0.0%       0.0%        0.2677\n",
-            "  128   250,000,000    256     0.0%       0.0%        0.2659\n",
-            "  128   250,000,000   1024     0.0%       0.0%        0.2671\n",
-            "  128   500,000,000     42     0.0%       0.0%        0.3052\n",
-            "  128   500,000,000    256     0.0%       0.0%        0.3045\n",
-            "  128   500,000,000   1024     0.0%       0.0%        0.3051\n",
-            "  128   800,000,000     42     0.0%       0.0%        0.3177\n",
-            "  128   800,000,000    256     0.0%       0.1%        0.3170\n",
-            "  128   800,000,000   1024     0.0%       0.0%        0.3176\n",
-            "  128 1,000,000,000     42     0.0%       0.1%        0.3216\n",
-            "  128 1,000,000,000    256     0.0%       0.0%        0.3198\n",
-            "  128 1,000,000,000   1024     0.0%       0.0%        0.3210\n",
-            "  256    50,000,000     42     0.0%       0.0%        0.1742\n",
-            "  256    50,000,000    256     0.0%       0.0%        0.1743\n",
-            "  256    50,000,000   1024     0.0%       0.0%        0.1754\n",
-            "  256   100,000,000     42     0.0%       0.0%        0.1788\n",
-            "  256   100,000,000    256     0.0%       0.0%        0.1784\n",
-            "  256   100,000,000   1024     0.0%       0.0%        0.1799\n",
-            "  256   250,000,000     42     0.0%       0.0%        0.1957\n",
-            "  256   250,000,000    256     0.0%       0.0%        0.1947\n",
-            "  256   250,000,000   1024     0.0%       0.0%        0.1964\n",
-            "  256   500,000,000     42     0.0%       0.1%        0.2062\n",
-            "  256   500,000,000    256     0.0%       0.0%        0.2055\n",
-            "  256   500,000,000   1024     0.0%       0.0%        0.2094\n",
-            "  256   800,000,000     42     0.0%       0.1%        0.2129\n",
-            "  256   800,000,000    256     0.0%       0.0%        0.2084\n",
-            "  256   800,000,000   1024     0.0%       0.1%        0.2137\n",
-            "  256 1,000,000,000     42     0.0%       0.1%        0.2166\n",
-            "  256 1,000,000,000    256     0.0%       0.0%        0.2110\n",
-            "  256 1,000,000,000   1024     0.0%       0.1%        0.2159\n",
-            "\n",
-            "Interpretation:\n",
-            "  - An elevated dead-feature rate at k=256 would indicate that a substantial\n",
-            "    fraction of features fail to learn a well-formed direction, consistent with\n",
-            "    an undertraining explanation rather than genuine cross-seed instability.\n",
-            "  - An elevated near-duplicate rate at k=256, stable across training-token\n",
-            "    checkpoints, would be consistent with persistent redundant feature splits\n",
-            "    that the TopK objective provides no pressure to resolve.\n",
-            "  - Should the near-duplicate rate decline with additional training while\n",
-            "    cross-seed stability (from the companion analysis) does not correspondingly\n",
-            "    increase, this would suggest redundant columns resolve to different winners\n",
-            "    across seeds rather than a shared winner, warranting closer examination of\n",
-            "    the seed-matching procedure itself rather than within-SAE redundancy alone.\n",
-            "\n",
-            "====================================================================================================\n",
-            "Activation-frequency diagnostics (requires logged checkpoint statistics)\n",
-            "====================================================================================================\n",
-            "No activation-frequency field was found in the checkpoints (keys checked:\n",
-            "  activation_frequency, feature_acts_ema, firing_counts).\n",
-            "If the training script logs firing statistics under a different key name,\n",
-            "add it to `candidate_keys` in tier2_activation_diagnostics() and re-run.\n",
-            "Otherwise, per-feature firing rates require a fresh forward pass over\n",
-            "held-out activations, which requires access to the training data or model.\n"
-          ]
-        }
-      ],
-      "source": [
-        "\"\"\"Check on the two alternative explanations for the instability of the SAE\"\"\"\n",
-        "\n",
-        "import re\n",
-        "import numpy as np\n",
-        "import torch\n",
-        "import torch.nn.functional as F\n",
-        "from pathlib import Path\n",
-        "from typing import Dict, List, Tuple\n",
-        "\n",
-        "CHECKPOINT_DIR = \".\"\n",
-        "SEEDS = [42, 256, 1024]\n",
-        "KS = [64, 128, 256]\n",
-        "DUPLICATE_THETA = 0.9   # decoder cosine sim above this = \"near-duplicate\" columns\n",
-        "DEAD_NORM_THRESH = 1e-3  # decoder columns with near-zero norm before normalization\n",
-        "\n",
-        "\n",
-        "def find_all_checkpoints(checkpoint_dir: str) -> List[Tuple[int, int, int, Path]]:\n",
-        "    \"\"\"Return list of (seed, k, tokens, path) for every checkpoint on disk.\"\"\"\n",
-        "    ckpt_dir = Path(checkpoint_dir)\n",
-        "    pattern = re.compile(r\"seed(\\d+)_k(\\d+)_tokens(\\d+)\\.pt\")\n",
-        "    out = []\n",
-        "    for f in ckpt_dir.glob(\"seed*_k*_tokens*.pt\"):\n",
-        "        m = pattern.match(f.name)\n",
-        "        if not m:\n",
-        "            continue\n",
-        "        seed, k, tokens = int(m.group(1)), int(m.group(2)), int(m.group(3))\n",
-        "        if seed in SEEDS and k in KS:\n",
-        "            out.append((seed, k, tokens, f))\n",
-        "    return sorted(out, key=lambda x: (x[1], x[2], x[0]))  # sort by k, tokens, seed\n",
-        "\n",
-        "\n",
-        "def tier1_structural_diagnostics(path: Path) -> dict:\n",
-        "    \"\"\"Compute dead-feature and near-duplicate-feature rates from decoder\n",
-        "    weights alone, for a single checkpoint. Requires no activation data.\"\"\"\n",
-        "    ckpt = torch.load(path, map_location=\"cpu\")\n",
-        "    state = ckpt[\"model_state_dict\"]\n",
-        "    W_dec = state[\"W_dec\"]  # [n_features, d_model], as saved (may be pre- or post-normalize)\n",
-        "\n",
-        "    # Raw decoder norms, prior to any unit-norm renormalization, to detect\n",
-        "    # collapsed (dead) columns.\n",
-        "    raw_norms = W_dec.norm(dim=1)\n",
-        "    n_features = W_dec.shape[0]\n",
-        "    dead_count = (raw_norms < DEAD_NORM_THRESH).sum().item()\n",
-        "\n",
-        "    # Redundancy: normalize decoder columns, then compute the maximum\n",
-        "    # off-diagonal cosine similarity for each feature against all others.\n",
-        "    W_norm = F.normalize(W_dec, dim=1)\n",
-        "    sim = W_norm @ W_norm.T\n",
-        "    sim.fill_diagonal_(-1.0)  # exclude self-similarity\n",
-        "    max_sim_per_feature, _ = sim.max(dim=1)\n",
-        "    near_dup_count = (max_sim_per_feature >= DUPLICATE_THETA).sum().item()\n",
-        "\n",
-        "    return {\n",
-        "        \"n_features\": n_features,\n",
-        "        \"dead_count\": dead_count,\n",
-        "        \"pct_dead\": 100 * dead_count / n_features,\n",
-        "        \"near_dup_count\": near_dup_count,\n",
-        "        \"pct_near_dup\": 100 * near_dup_count / n_features,\n",
-        "        \"mean_max_sim\": max_sim_per_feature.mean().item(),\n",
-        "    }\n",
-        "\n",
-        "\n",
-        "def tier2_activation_diagnostics(path: Path) -> dict:\n",
-        "    \"\"\"Compute per-feature firing statistics from logged activation data.\n",
-        "    Requires the checkpoint to contain activation statistics under one of\n",
-        "    the recognized key names ('activation_frequency', 'feature_acts_ema',\n",
-        "    'firing_counts'); update `candidate_keys` below if the training script\n",
-        "    logs these under a different name.\"\"\"\n",
-        "    ckpt = torch.load(path, map_location=\"cpu\")\n",
-        "    candidate_keys = [\"activation_frequency\", \"feature_acts_ema\", \"firing_counts\"]\n",
-        "    freq_key = next((k for k in candidate_keys if k in ckpt), None)\n",
-        "\n",
-        "    if freq_key is None:\n",
-        "        return {\"available\": False}\n",
-        "\n",
-        "    freq = ckpt[freq_key]\n",
-        "    if torch.is_tensor(freq):\n",
-        "        freq = freq.numpy()\n",
-        "\n",
-        "    return {\n",
-        "        \"available\": True,\n",
-        "        \"source_key\": freq_key,\n",
-        "        \"mean_firing_rate\": float(np.mean(freq)),\n",
-        "        \"pct_never_fired\": 100 * float((freq == 0).sum()) / len(freq),\n",
-        "        \"pct_rarely_fired\": 100 * float((freq < 1e-4).sum()) / len(freq),  # tune threshold to your k / batch size\n",
-        "    }\n",
-        "\n",
-        "    # If activation statistics were not logged at training time, per-feature\n",
-        "    # firing rates can be recovered by running a forward pass over a\n",
-        "    # held-out batch of activations with the loaded SAE and counting\n",
-        "    # firings directly. This requires access to the original activation\n",
-        "    # dataset or the base model used to generate it.\n",
-        "\n",
-        "\n",
-        "def main():\n",
-        "    checkpoints = find_all_checkpoints(CHECKPOINT_DIR)\n",
-        "    if not checkpoints:\n",
-        "        print(\"No checkpoints found — check CHECKPOINT_DIR.\")\n",
-        "        return\n",
-        "\n",
-        "    print(f\"Found {len(checkpoints)} checkpoints.\\n\")\n",
-        "    print(\"=\" * 100)\n",
-        "    print(\"Structural diagnostics: dead-feature and near-duplicate-feature rates\")\n",
-        "    print(\"=\" * 100)\n",
-        "    header = f\"{'k':>5} {'tokens':>13} {'seed':>6} {'%dead':>8} {'%near-dup':>10} {'mean max-sim':>13}\"\n",
-        "    print(header)\n",
-        "\n",
-        "    tier1_results = []\n",
-        "    for seed, k, tokens, path in checkpoints:\n",
-        "        d = tier1_structural_diagnostics(path)\n",
-        "        tier1_results.append((seed, k, tokens, d))\n",
-        "        print(f\"{k:>5} {tokens:>13,} {seed:>6} {d['pct_dead']:>7.1f}% {d['pct_near_dup']:>9.1f}% {d['mean_max_sim']:>13.4f}\")\n",
-        "\n",
-        "    print()\n",
-        "    print(\"Interpretation:\")\n",
-        "    print(\"  - An elevated dead-feature rate at k=256 would indicate that a substantial\")\n",
-        "    print(\"    fraction of features fail to learn a well-formed direction, consistent with\")\n",
-        "    print(\"    an undertraining explanation rather than genuine cross-seed instability.\")\n",
-        "    print(\"  - An elevated near-duplicate rate at k=256, stable across training-token\")\n",
-        "    print(\"    checkpoints, would be consistent with persistent redundant feature splits\")\n",
-        "    print(\"    that the TopK objective provides no pressure to resolve.\")\n",
-        "    print(\"  - Should the near-duplicate rate decline with additional training while\")\n",
-        "    print(\"    cross-seed stability (from the companion analysis) does not correspondingly\")\n",
-        "    print(\"    increase, this would suggest redundant columns resolve to different winners\")\n",
-        "    print(\"    across seeds rather than a shared winner, warranting closer examination of\")\n",
-        "    print(\"    the seed-matching procedure itself rather than within-SAE redundancy alone.\")\n",
-        "\n",
-        "    print()\n",
-        "    print(\"=\" * 100)\n",
-        "    print(\"Activation-frequency diagnostics (requires logged checkpoint statistics)\")\n",
-        "    print(\"=\" * 100)\n",
-        "    sample_check = tier2_activation_diagnostics(checkpoints[0][3])\n",
-        "    if not sample_check.get(\"available\"):\n",
-        "        print(\"No activation-frequency field was found in the checkpoints (keys checked:\")\n",
-        "        print(\"  activation_frequency, feature_acts_ema, firing_counts).\")\n",
-        "        print(\"If the training script logs firing statistics under a different key name,\")\n",
-        "        print(\"add it to `candidate_keys` in tier2_activation_diagnostics() and re-run.\")\n",
-        "        print(\"Otherwise, per-feature firing rates require a fresh forward pass over\")\n",
-        "        print(\"held-out activations, which requires access to the training data or model.\")\n",
-        "    else:\n",
-        "        header2 = f\"{'k':>5} {'tokens':>13} {'seed':>6} {'mean rate':>10} {'%never-fired':>13} {'%rarely-fired':>14}\"\n",
-        "        print(header2)\n",
-        "        for seed, k, tokens, path in checkpoints:\n",
-        "            d = tier2_activation_diagnostics(path)\n",
-        "            if d.get(\"available\"):\n",
-        "                print(f\"{k:>5} {tokens:>13,} {seed:>6} {d['mean_firing_rate']:>10.5f} \"\n",
-        "                      f\"{d['pct_never_fired']:>12.1f}% {d['pct_rarely_fired']:>13.1f}%\")\n",
-        "\n",
-        "\n",
-        "if __name__ == \"__main__\":\n",
-        "    main()"
-      ]
+"""Check on the two alternative explanations for the instability of the SAE"""
+
+import re
+import numpy as np
+import torch
+import torch.nn.functional as F
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+CHECKPOINT_DIR = "."
+SEEDS = [42, 256, 1024]
+KS = [64, 128, 256]
+DUPLICATE_THETA = 0.9   # decoder cosine sim above this = "near-duplicate" columns
+DEAD_NORM_THRESH = 1e-3  # decoder columns with near-zero norm before normalization
+
+
+def find_all_checkpoints(checkpoint_dir: str) -> List[Tuple[int, int, int, Path]]:
+    """Return list of (seed, k, tokens, path) for every checkpoint on disk."""
+    ckpt_dir = Path(checkpoint_dir)
+    pattern = re.compile(r"seed(\d+)_k(\d+)_tokens(\d+)\.pt")
+    out = []
+    for f in ckpt_dir.glob("seed*_k*_tokens*.pt"):
+        m = pattern.match(f.name)
+        if not m:
+            continue
+        seed, k, tokens = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if seed in SEEDS and k in KS:
+            out.append((seed, k, tokens, f))
+    return sorted(out, key=lambda x: (x[1], x[2], x[0]))  # sort by k, tokens, seed
+
+
+def tier1_structural_diagnostics(path: Path) -> dict:
+    """Compute dead-feature and near-duplicate-feature rates from decoder
+    weights alone, for a single checkpoint. Requires no activation data."""
+    ckpt = torch.load(path, map_location="cpu")
+    state = ckpt["model_state_dict"]
+    W_dec = state["W_dec"]  # [n_features, d_model], as saved (may be pre- or post-normalize)
+
+    # Raw decoder norms, prior to any unit-norm renormalization, to detect
+    # collapsed (dead) columns.
+    raw_norms = W_dec.norm(dim=1)
+    n_features = W_dec.shape[0]
+    dead_count = (raw_norms < DEAD_NORM_THRESH).sum().item()
+
+    # Redundancy: normalize decoder columns, then compute the maximum
+    # off-diagonal cosine similarity for each feature against all others.
+    W_norm = F.normalize(W_dec, dim=1)
+    sim = W_norm @ W_norm.T
+    sim.fill_diagonal_(-1.0)  # exclude self-similarity
+    max_sim_per_feature, _ = sim.max(dim=1)
+    near_dup_count = (max_sim_per_feature >= DUPLICATE_THETA).sum().item()
+
+    return {
+        "n_features": n_features,
+        "dead_count": dead_count,
+        "pct_dead": 100 * dead_count / n_features,
+        "near_dup_count": near_dup_count,
+        "pct_near_dup": 100 * near_dup_count / n_features,
+        "mean_max_sim": max_sim_per_feature.mean().item(),
     }
-  ],
-  "metadata": {
-    "kernelspec": {
-      "display_name": "base",
-      "language": "python",
-      "name": "python3"
-    },
-    "language_info": {
-      "codemirror_mode": {
-        "name": "ipython",
-        "version": 3
-      },
-      "file_extension": ".py",
-      "mimetype": "text/x-python",
-      "name": "python",
-      "nbconvert_exporter": "python",
-      "pygments_lexer": "ipython3",
-      "version": "3.11.4"
+
+
+def tier2_activation_diagnostics(path: Path) -> dict:
+    """Compute per-feature firing statistics from logged activation data.
+    Requires the checkpoint to contain activation statistics under one of
+    the recognized key names ('activation_frequency', 'feature_acts_ema',
+    'firing_counts'); update `candidate_keys` below if the training script
+    logs these under a different name."""
+    ckpt = torch.load(path, map_location="cpu")
+    candidate_keys = ["activation_frequency", "feature_acts_ema", "firing_counts"]
+    freq_key = next((k for k in candidate_keys if k in ckpt), None)
+
+    if freq_key is None:
+        return {"available": False}
+
+    freq = ckpt[freq_key]
+    if torch.is_tensor(freq):
+        freq = freq.numpy()
+
+    return {
+        "available": True,
+        "source_key": freq_key,
+        "mean_firing_rate": float(np.mean(freq)),
+        "pct_never_fired": 100 * float((freq == 0).sum()) / len(freq),
+        "pct_rarely_fired": 100 * float((freq < 1e-4).sum()) / len(freq),  # tune threshold to your k / batch size
     }
-  },
-  "nbformat": 4,
-  "nbformat_minor": 5
-}
+
+    # If activation statistics were not logged at training time, per-feature
+    # firing rates can be recovered by running a forward pass over a
+    # held-out batch of activations with the loaded SAE and counting
+    # firings directly. This requires access to the original activation
+    # dataset or the base model used to generate it.
+
+
+def main():
+    checkpoints = find_all_checkpoints(CHECKPOINT_DIR)
+    if not checkpoints:
+        print("No checkpoints found — check CHECKPOINT_DIR.")
+        return
+
+    print(f"Found {len(checkpoints)} checkpoints.\n")
+    print("=" * 100)
+    print("Structural diagnostics: dead-feature and near-duplicate-feature rates")
+    print("=" * 100)
+    header = f"{'k':>5} {'tokens':>13} {'seed':>6} {'%dead':>8} {'%near-dup':>10} {'mean max-sim':>13}"
+    print(header)
+
+    tier1_results = []
+    for seed, k, tokens, path in checkpoints:
+        d = tier1_structural_diagnostics(path)
+        tier1_results.append((seed, k, tokens, d))
+        print(f"{k:>5} {tokens:>13,} {seed:>6} {d['pct_dead']:>7.1f}% {d['pct_near_dup']:>9.1f}% {d['mean_max_sim']:>13.4f}")
+
+    print()
+    print("Interpretation:")
+    print("  - An elevated dead-feature rate at k=256 would indicate that a substantial")
+    print("    fraction of features fail to learn a well-formed direction, consistent with")
+    print("    an undertraining explanation rather than genuine cross-seed instability.")
+    print("  - An elevated near-duplicate rate at k=256, stable across training-token")
+    print("    checkpoints, would be consistent with persistent redundant feature splits")
+    print("    that the TopK objective provides no pressure to resolve.")
+    print("  - Should the near-duplicate rate decline with additional training while")
+    print("    cross-seed stability (from the companion analysis) does not correspondingly")
+    print("    increase, this would suggest redundant columns resolve to different winners")
+    print("    across seeds rather than a shared winner, warranting closer examination of")
+    print("    the seed-matching procedure itself rather than within-SAE redundancy alone.")
+
+    print()
+    print("=" * 100)
+    print("Activation-frequency diagnostics (requires logged checkpoint statistics)")
+    print("=" * 100)
+    sample_check = tier2_activation_diagnostics(checkpoints[0][3])
+    if not sample_check.get("available"):
+        print("No activation-frequency field was found in the checkpoints (keys checked:")
+        print("  activation_frequency, feature_acts_ema, firing_counts).")
+        print("If the training script logs firing statistics under a different key name,")
+        print("add it to `candidate_keys` in tier2_activation_diagnostics() and re-run.")
+        print("Otherwise, per-feature firing rates require a fresh forward pass over")
+        print("held-out activations, which requires access to the training data or model.")
+    else:
+        header2 = f"{'k':>5} {'tokens':>13} {'seed':>6} {'mean rate':>10} {'%never-fired':>13} {'%rarely-fired':>14}"
+        print(header2)
+        for seed, k, tokens, path in checkpoints:
+            d = tier2_activation_diagnostics(path)
+            if d.get("available"):
+                print(f"{k:>5} {tokens:>13,} {seed:>6} {d['mean_firing_rate']:>10.5f} "
+                      f"{d['pct_never_fired']:>12.1f}% {d['pct_rarely_fired']:>13.1f}%")
+
+
+if __name__ == "__main__":
+    main()
