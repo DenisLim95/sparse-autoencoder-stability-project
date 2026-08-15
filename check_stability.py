@@ -1,417 +1,223 @@
-{
-  "cells": [
-    {
-      "cell_type": "code",
-      "execution_count": 1,
-      "id": "8d5a4439",
-      "metadata": {},
-      "outputs": [
-        {
-          "name": "stdout",
-          "output_type": "stream",
-          "text": [
-            "Analyzing (k, token_count) groups (seeds used per group):\n",
-            "  k=64, tokens=50,000,000: [42, 256, 1024]\n",
-            "  k=64, tokens=100,000,000: [42, 256, 1024]\n",
-            "  k=64, tokens=250,000,000: [42, 256, 1024]\n",
-            "  k=64, tokens=500,000,000: [42, 256, 1024]\n",
-            "  k=64, tokens=800,000,000: [42, 256, 1024]\n",
-            "  k=64, tokens=1,000,000,000: [42, 256, 1024]\n",
-            "  k=128, tokens=50,000,000: [42, 256, 1024]\n",
-            "  k=128, tokens=100,000,000: [42, 256, 1024]\n",
-            "  k=128, tokens=250,000,000: [42, 256, 1024]\n",
-            "  k=128, tokens=500,000,000: [42, 256, 1024]\n",
-            "  k=128, tokens=800,000,000: [42, 256, 1024]\n",
-            "  k=128, tokens=1,000,000,000: [42, 256, 1024]\n",
-            "  k=256, tokens=50,000,000: [42, 256, 1024]\n",
-            "  k=256, tokens=100,000,000: [42, 256, 1024]\n",
-            "  k=256, tokens=250,000,000: [42, 256, 1024]\n",
-            "  k=256, tokens=500,000,000: [42, 256, 1024]\n",
-            "  k=256, tokens=800,000,000: [42, 256, 1024]\n",
-            "  k=256, tokens=1,000,000,000: [42, 256, 1024]\n",
-            "\n",
-            "--- k=64, 50,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.1702\n",
-            "  Stable:      983 (12.0%)\n",
-            "  Unstable:    6387 (78.0%)\n",
-            "  Discarded:   822 (10.0%)\n",
-            "\n",
-            "--- k=64, 100,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.3163\n",
-            "  Stable:      1974 (24.1%)\n",
-            "  Unstable:    4983 (60.8%)\n",
-            "  Discarded:   1235 (15.1%)\n",
-            "\n",
-            "--- k=64, 250,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.5547\n",
-            "  Stable:      3761 (45.9%)\n",
-            "  Unstable:    2865 (35.0%)\n",
-            "  Discarded:   1566 (19.1%)\n",
-            "\n",
-            "--- k=64, 500,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.6649\n",
-            "  Stable:      4742 (57.9%)\n",
-            "  Unstable:    2040 (24.9%)\n",
-            "  Discarded:   1410 (17.2%)\n",
-            "\n",
-            "--- k=64, 800,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.7034\n",
-            "  Stable:      5114 (62.4%)\n",
-            "  Unstable:    1782 (21.8%)\n",
-            "  Discarded:   1296 (15.8%)\n",
-            "\n",
-            "--- k=64, 1,000,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.7197\n",
-            "  Stable:      5256 (64.2%)\n",
-            "  Unstable:    1657 (20.2%)\n",
-            "  Discarded:   1279 (15.6%)\n",
-            "\n",
-            "--- k=128, 50,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.0697\n",
-            "  Stable:      358 (4.4%)\n",
-            "  Unstable:    7408 (90.4%)\n",
-            "  Discarded:   426 (5.2%)\n",
-            "\n",
-            "--- k=128, 100,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.1661\n",
-            "  Stable:      922 (11.3%)\n",
-            "  Unstable:    6393 (78.0%)\n",
-            "  Discarded:   877 (10.7%)\n",
-            "\n",
-            "--- k=128, 250,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.3928\n",
-            "  Stable:      2504 (30.6%)\n",
-            "  Unstable:    4260 (52.0%)\n",
-            "  Discarded:   1428 (17.4%)\n",
-            "\n",
-            "--- k=128, 500,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.5686\n",
-            "  Stable:      3886 (47.4%)\n",
-            "  Unstable:    2762 (33.7%)\n",
-            "  Discarded:   1544 (18.8%)\n",
-            "\n",
-            "--- k=128, 800,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.6295\n",
-            "  Stable:      4414 (53.9%)\n",
-            "  Unstable:    2293 (28.0%)\n",
-            "  Discarded:   1485 (18.1%)\n",
-            "\n",
-            "--- k=128, 1,000,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.6453\n",
-            "  Stable:      4561 (55.7%)\n",
-            "  Unstable:    2181 (26.6%)\n",
-            "  Discarded:   1450 (17.7%)\n",
-            "\n",
-            "--- k=256, 50,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.0018\n",
-            "  Stable:      7 (0.1%)\n",
-            "  Unstable:    8169 (99.7%)\n",
-            "  Discarded:   16 (0.2%)\n",
-            "\n",
-            "--- k=256, 100,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.0038\n",
-            "  Stable:      21 (0.3%)\n",
-            "  Unstable:    8150 (99.5%)\n",
-            "  Discarded:   21 (0.3%)\n",
-            "\n",
-            "--- k=256, 250,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.0097\n",
-            "  Stable:      56 (0.7%)\n",
-            "  Unstable:    8089 (98.7%)\n",
-            "  Discarded:   47 (0.6%)\n",
-            "\n",
-            "--- k=256, 500,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.0290\n",
-            "  Stable:      159 (1.9%)\n",
-            "  Unstable:    7876 (96.1%)\n",
-            "  Discarded:   157 (1.9%)\n",
-            "\n",
-            "--- k=256, 800,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.0376\n",
-            "  Stable:      226 (2.8%)\n",
-            "  Unstable:    7802 (95.2%)\n",
-            "  Discarded:   164 (2.0%)\n",
-            "\n",
-            "--- k=256, 1,000,000,000 tokens (seeds=[42, 256, 1024]) ---\n",
-            "  Mean p_hat:  0.0440\n",
-            "  Stable:      278 (3.4%)\n",
-            "  Unstable:    7749 (94.6%)\n",
-            "  Discarded:   165 (2.0%)\n",
-            "\n",
-            "====================================================================================\n",
-            "SUMMARY: stability vs. training token count, by k\n",
-            "====================================================================================\n",
-            "     k          Tokens  n_seeds   Mean p_hat   % Stable   % Unstable\n",
-            "    64      50,000,000        3       0.1702      12.0%        78.0%\n",
-            "    64     100,000,000        3       0.3163      24.1%        60.8%\n",
-            "    64     250,000,000        3       0.5547      45.9%        35.0%\n",
-            "    64     500,000,000        3       0.6649      57.9%        24.9%\n",
-            "    64     800,000,000        3       0.7034      62.4%        21.8%\n",
-            "    64   1,000,000,000        3       0.7197      64.2%        20.2%\n",
-            "   128      50,000,000        3       0.0697       4.4%        90.4%\n",
-            "   128     100,000,000        3       0.1661      11.3%        78.0%\n",
-            "   128     250,000,000        3       0.3928      30.6%        52.0%\n",
-            "   128     500,000,000        3       0.5686      47.4%        33.7%\n",
-            "   128     800,000,000        3       0.6295      53.9%        28.0%\n",
-            "   128   1,000,000,000        3       0.6453      55.7%        26.6%\n",
-            "   256      50,000,000        3       0.0018       0.1%        99.7%\n",
-            "   256     100,000,000        3       0.0038       0.3%        99.5%\n",
-            "   256     250,000,000        3       0.0097       0.7%        98.7%\n",
-            "   256     500,000,000        3       0.0290       1.9%        96.1%\n",
-            "   256     800,000,000        3       0.0376       2.8%        95.2%\n",
-            "   256   1,000,000,000        3       0.0440       3.4%        94.6%\n",
-            "\n",
-            "Saved summary to outputs/stability_by_token_count.npz\n",
-            "Saved plot to outputs/stability_by_token_count.png\n"
-          ]
-        }
-      ],
-      "source": [
-        "# -*- coding: utf-8 -*-\n",
-        "\"\"\"\n",
-        "analyze_stability_by_tokens.py\n",
-        "\n",
-        "Loads the SAE checkpoints saved by prelim_experiments.py, grouped by (k, token\n",
-        "count) across available seeds, and computes feature stability separately at\n",
-        "each (k, token count) pair, so you can see how stability changes as training\n",
-        "progresses AND how it varies with the TopK sparsity level.\n",
-        "\n",
-        "Updated for the TopK sweep: filenames now encode k (e.g.\n",
-        "seed42_k64_tokens100000000.pt), and stability comparisons are only made\n",
-        "within a fixed k — comparing across different k values would conflate\n",
-        "\"instability\" with \"different sparsity level,\" which is exactly the\n",
-        "confound switching to TopK was meant to remove.\n",
-        "\"\"\"\n",
-        "\n",
-        "import re\n",
-        "import numpy as np\n",
-        "import torch\n",
-        "import torch.nn as nn\n",
-        "import torch.nn.functional as F\n",
-        "from pathlib import Path\n",
-        "from typing import Dict, List, Tuple\n",
-        "\n",
-        "CHECKPOINT_DIR = \".\"  # .pt files live next to this notebook\n",
-        "SEEDS = [42, 256, 1024]  # matches the actual sweep\n",
-        "KS = [64, 128, 256]\n",
-        "MIN_SEEDS = 2  # analyze a (k, token_count) pair if >= this many seeds exist\n",
-        "THETA = 0.7      # Gerasimov et al. decoder-only matching threshold\n",
-        "EPSILON = 0.05   # endpoint binarization\n",
-        "\n",
-        "\n",
-        "class SparseAutoencoder(nn.Module):\n",
-        "    \"\"\"Must match the architecture in prelim_experiments.py exactly, since we're\n",
-        "    loading state dicts saved by that script.\"\"\"\n",
-        "\n",
-        "    def __init__(self, d_model: int, n_features: int, seed: int):\n",
-        "        super().__init__()\n",
-        "        torch.manual_seed(seed)\n",
-        "        self.d_model = d_model\n",
-        "        self.n_features = n_features\n",
-        "        self.W_enc = nn.Parameter(torch.randn(d_model, n_features) * 0.01)\n",
-        "        self.b_enc = nn.Parameter(torch.zeros(n_features))\n",
-        "        self.W_dec = nn.Parameter(torch.randn(n_features, d_model) * 0.01)\n",
-        "        self.b_dec = nn.Parameter(torch.zeros(d_model))\n",
-        "        with torch.no_grad():\n",
-        "            self.W_dec.data = F.normalize(self.W_dec.data, dim=1)\n",
-        "\n",
-        "    def encode(self, x):\n",
-        "        # NOTE: this is unused by the stability analysis below (which only\n",
-        "        # reads W_dec), but if you reuse this class elsewhere for inference\n",
-        "        # under TopK, this ReLU-only encode() does NOT enforce the hard\n",
-        "        # top-k mask — you'd need to add that here to match training-time\n",
-        "        # behavior.\n",
-        "        return F.relu((x - self.b_dec) @ self.W_enc + self.b_enc)\n",
-        "\n",
-        "    def decode(self, f):\n",
-        "        return f @ self.W_dec + self.b_dec\n",
-        "\n",
-        "\n",
-        "def compute_decoder_similarity(sae1, sae2) -> torch.Tensor:\n",
-        "    W1 = F.normalize(sae1.W_dec.detach(), dim=1)\n",
-        "    W2 = F.normalize(sae2.W_dec.detach(), dim=1)\n",
-        "    return (W1 @ W2.T).cpu()\n",
-        "\n",
-        "\n",
-        "def compute_reappearance_probability(saes: Dict[int, SparseAutoencoder], theta: float) -> np.ndarray:\n",
-        "    \"\"\"Decoder-only, many-to-one argmax matching (Gerasimov et al. Eq. 3-4).\"\"\"\n",
-        "    seeds = list(saes.keys())\n",
-        "    anchor_sae = saes[seeds[0]]\n",
-        "    n_features = anchor_sae.n_features\n",
-        "    reappearance_counts = np.zeros(n_features)\n",
-        "\n",
-        "    for other_seed in seeds[1:]:\n",
-        "        sim_matrix = compute_decoder_similarity(anchor_sae, saes[other_seed])\n",
-        "        best_sim, _ = sim_matrix.max(dim=1)\n",
-        "        reappearance_counts += (best_sim.numpy() >= theta).astype(float)\n",
-        "\n",
-        "    return reappearance_counts / (len(seeds) - 1)\n",
-        "\n",
-        "\n",
-        "def find_groups_with_seeds(\n",
-        "    checkpoint_dir: str, seeds: list, ks: list, min_seeds: int = 2\n",
-        ") -> Dict[Tuple[int, int], List[int]]:\n",
-        "    \"\"\"Return {(k, token_count): [seeds present]} for groups with >= min_seeds checkpoints.\"\"\"\n",
-        "    ckpt_dir = Path(checkpoint_dir)\n",
-        "    pattern = re.compile(r\"seed(\\d+)_k(\\d+)_tokens(\\d+)\\.pt\")\n",
-        "    seed_set = set(seeds)\n",
-        "    k_set = set(ks)\n",
-        "    seeds_by_group: Dict[Tuple[int, int], set] = {}\n",
-        "\n",
-        "    for f in ckpt_dir.glob(\"seed*_k*_tokens*.pt\"):\n",
-        "        m = pattern.match(f.name)\n",
-        "        if not m:\n",
-        "            continue\n",
-        "        seed, k, tokens = int(m.group(1)), int(m.group(2)), int(m.group(3))\n",
-        "        if seed not in seed_set or k not in k_set:\n",
-        "            continue\n",
-        "        seeds_by_group.setdefault((k, tokens), set()).add(seed)\n",
-        "\n",
-        "    return {\n",
-        "        g: sorted(s)\n",
-        "        for g, s in sorted(seeds_by_group.items())\n",
-        "        if len(s) >= min_seeds\n",
-        "    }\n",
-        "\n",
-        "\n",
-        "def load_saes_at_group(checkpoint_dir: str, seeds: list, k: int, token_count: int) -> Dict[int, SparseAutoencoder]:\n",
-        "    saes = {}\n",
-        "    for seed in seeds:\n",
-        "        path = Path(checkpoint_dir) / f\"seed{seed}_k{k}_tokens{token_count}.pt\"\n",
-        "        ckpt = torch.load(path, map_location=\"cpu\")\n",
-        "        cfg = ckpt[\"config\"]\n",
-        "        sae = SparseAutoencoder(cfg[\"d_model\"], cfg[\"n_features\"], seed=seed)\n",
-        "        sae.load_state_dict(ckpt[\"model_state_dict\"])\n",
-        "        saes[seed] = sae\n",
-        "    return saes\n",
-        "\n",
-        "\n",
-        "def main():\n",
-        "    available = find_groups_with_seeds(CHECKPOINT_DIR, SEEDS, KS, min_seeds=MIN_SEEDS)\n",
-        "\n",
-        "    if not available:\n",
-        "        print(f\"No (k, token_count) group has >= {MIN_SEEDS} seeds among {SEEDS} x k={KS}.\")\n",
-        "        print(\"Re-run once more seeds/checkpoints have finished.\")\n",
-        "        return\n",
-        "\n",
-        "    print(\"Analyzing (k, token_count) groups (seeds used per group):\")\n",
-        "    for (k, t), seeds_here in available.items():\n",
-        "        print(f\"  k={k}, tokens={t:,}: {seeds_here}\")\n",
-        "    print()\n",
-        "\n",
-        "    results = []\n",
-        "    for (k, token_count), seeds_here in available.items():\n",
-        "        saes = load_saes_at_group(CHECKPOINT_DIR, seeds_here, k, token_count)\n",
-        "        p_hat = compute_reappearance_probability(saes, theta=THETA)\n",
-        "\n",
-        "        stable = (p_hat >= (1 - EPSILON)).sum()\n",
-        "        unstable = (p_hat <= EPSILON).sum()\n",
-        "        discarded = len(p_hat) - stable - unstable\n",
-        "\n",
-        "        results.append({\n",
-        "            \"k\": k,\n",
-        "            \"token_count\": token_count,\n",
-        "            \"seeds\": seeds_here,\n",
-        "            \"n_seeds\": len(seeds_here),\n",
-        "            \"n_features\": len(p_hat),\n",
-        "            \"mean_p_hat\": p_hat.mean(),\n",
-        "            \"stable\": stable,\n",
-        "            \"unstable\": unstable,\n",
-        "            \"discarded\": discarded,\n",
-        "            \"pct_stable\": 100 * stable / len(p_hat),\n",
-        "        })\n",
-        "\n",
-        "        print(f\"--- k={k}, {token_count:,} tokens (seeds={seeds_here}) ---\")\n",
-        "        print(f\"  Mean p_hat:  {p_hat.mean():.4f}\")\n",
-        "        print(f\"  Stable:      {stable} ({100 * stable / len(p_hat):.1f}%)\")\n",
-        "        print(f\"  Unstable:    {unstable} ({100 * unstable / len(p_hat):.1f}%)\")\n",
-        "        print(f\"  Discarded:   {discarded} ({100 * discarded / len(p_hat):.1f}%)\")\n",
-        "        print()\n",
-        "\n",
-        "    print(\"=\" * 84)\n",
-        "    print(\"SUMMARY: stability vs. training token count, by k\")\n",
-        "    print(\"=\" * 84)\n",
-        "    print(f\"{'k':>6} {'Tokens':>15} {'n_seeds':>8} {'Mean p_hat':>12} {'% Stable':>10} {'% Unstable':>12}\")\n",
-        "    for r in results:\n",
-        "        print(\n",
-        "            f\"{r['k']:>6} {r['token_count']:>15,} {r['n_seeds']:>8} {r['mean_p_hat']:>12.4f} \"\n",
-        "            f\"{r['pct_stable']:>9.1f}% {100 * r['unstable'] / r['n_features']:>11.1f}%\"\n",
-        "        )\n",
-        "\n",
-        "    # Save results for later use (e.g. plotting, or feeding into the classifier notebook)\n",
-        "    Path(\"outputs\").mkdir(exist_ok=True)\n",
-        "    np.savez(\n",
-        "        \"outputs/stability_by_token_count.npz\",\n",
-        "        k=np.array([r[\"k\"] for r in results]),\n",
-        "        token_counts=np.array([r[\"token_count\"] for r in results]),\n",
-        "        n_seeds=np.array([r[\"n_seeds\"] for r in results]),\n",
-        "        mean_p_hat=np.array([r[\"mean_p_hat\"] for r in results]),\n",
-        "        pct_stable=np.array([r[\"pct_stable\"] for r in results]),\n",
-        "    )\n",
-        "    print(\"\\nSaved summary to outputs/stability_by_token_count.npz\")\n",
-        "\n",
-        "    # Try to plot, if matplotlib is available and there's a display backend\n",
-        "    try:\n",
-        "        import matplotlib\n",
-        "        matplotlib.use(\"Agg\")  # headless-safe backend, saves to file instead of showing\n",
-        "        import matplotlib.pyplot as plt\n",
-        "\n",
-        "        ks_present = sorted(set(r[\"k\"] for r in results))\n",
-        "        fig, axes = plt.subplots(1, 2, figsize=(12, 4))\n",
-        "\n",
-        "        for k in ks_present:\n",
-        "            rows = [r for r in results if r[\"k\"] == k]\n",
-        "            rows.sort(key=lambda r: r[\"token_count\"])\n",
-        "            token_counts = [r[\"token_count\"] for r in rows]\n",
-        "            pct_stable = [r[\"pct_stable\"] for r in rows]\n",
-        "            mean_p_hat = [r[\"mean_p_hat\"] for r in rows]\n",
-        "\n",
-        "            axes[0].plot(token_counts, pct_stable, marker=\"o\", label=f\"k={k}\")\n",
-        "            axes[1].plot(token_counts, mean_p_hat, marker=\"o\", label=f\"k={k}\")\n",
-        "\n",
-        "        axes[0].set_xscale(\"log\")\n",
-        "        axes[0].set_xlabel(\"Training tokens\")\n",
-        "        axes[0].set_ylabel(\"% features stable\")\n",
-        "        axes[0].set_title(\"Stability vs. training scale, by k\")\n",
-        "        axes[0].legend()\n",
-        "\n",
-        "        axes[1].set_xscale(\"log\")\n",
-        "        axes[1].set_xlabel(\"Training tokens\")\n",
-        "        axes[1].set_ylabel(\"Mean reappearance probability\")\n",
-        "        axes[1].set_title(\"Mean p_hat vs. training scale, by k\")\n",
-        "        axes[1].legend()\n",
-        "\n",
-        "        plt.tight_layout()\n",
-        "        plt.savefig(\"outputs/stability_by_token_count.png\", dpi=150)\n",
-        "        print(\"Saved plot to outputs/stability_by_token_count.png\")\n",
-        "    except Exception as e:\n",
-        "        print(f\"(Skipped plotting: {e})\")\n",
-        "\n",
-        "\n",
-        "if __name__ == \"__main__\":\n",
-        "    main()"
-      ]
+# -*- coding: utf-8 -*-
+"""
+analyze_stability_by_tokens.py
+
+Loads the SAE checkpoints saved by prelim_experiments.py, grouped by (k, token
+count) across available seeds, and computes feature stability separately at
+each (k, token count) pair, so you can see how stability changes as training
+progresses AND how it varies with the TopK sparsity level.
+
+Updated for the TopK sweep: filenames now encode k (e.g.
+seed42_k64_tokens100000000.pt), and stability comparisons are only made
+within a fixed k — comparing across different k values would conflate
+"instability" with "different sparsity level," which is exactly the
+confound switching to TopK was meant to remove.
+"""
+
+import re
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from pathlib import Path
+from typing import Dict, List, Tuple
+
+CHECKPOINT_DIR = "."  # .pt files live next to this notebook
+SEEDS = [42, 256, 1024]  # matches the actual sweep
+KS = [64, 128, 256]
+MIN_SEEDS = 2  # analyze a (k, token_count) pair if >= this many seeds exist
+THETA = 0.7      # Gerasimov et al. decoder-only matching threshold
+EPSILON = 0.05   # endpoint binarization
+
+
+class SparseAutoencoder(nn.Module):
+    """Must match the architecture in prelim_experiments.py exactly, since we're
+    loading state dicts saved by that script."""
+
+    def __init__(self, d_model: int, n_features: int, seed: int):
+        super().__init__()
+        torch.manual_seed(seed)
+        self.d_model = d_model
+        self.n_features = n_features
+        self.W_enc = nn.Parameter(torch.randn(d_model, n_features) * 0.01)
+        self.b_enc = nn.Parameter(torch.zeros(n_features))
+        self.W_dec = nn.Parameter(torch.randn(n_features, d_model) * 0.01)
+        self.b_dec = nn.Parameter(torch.zeros(d_model))
+        with torch.no_grad():
+            self.W_dec.data = F.normalize(self.W_dec.data, dim=1)
+
+    def encode(self, x):
+        # NOTE: this is unused by the stability analysis below (which only
+        # reads W_dec), but if you reuse this class elsewhere for inference
+        # under TopK, this ReLU-only encode() does NOT enforce the hard
+        # top-k mask — you'd need to add that here to match training-time
+        # behavior.
+        return F.relu((x - self.b_dec) @ self.W_enc + self.b_enc)
+
+    def decode(self, f):
+        return f @ self.W_dec + self.b_dec
+
+
+def compute_decoder_similarity(sae1, sae2) -> torch.Tensor:
+    W1 = F.normalize(sae1.W_dec.detach(), dim=1)
+    W2 = F.normalize(sae2.W_dec.detach(), dim=1)
+    return (W1 @ W2.T).cpu()
+
+
+def compute_reappearance_probability(saes: Dict[int, SparseAutoencoder], theta: float) -> np.ndarray:
+    """Decoder-only, many-to-one argmax matching (Gerasimov et al. Eq. 3-4)."""
+    seeds = list(saes.keys())
+    anchor_sae = saes[seeds[0]]
+    n_features = anchor_sae.n_features
+    reappearance_counts = np.zeros(n_features)
+
+    for other_seed in seeds[1:]:
+        sim_matrix = compute_decoder_similarity(anchor_sae, saes[other_seed])
+        best_sim, _ = sim_matrix.max(dim=1)
+        reappearance_counts += (best_sim.numpy() >= theta).astype(float)
+
+    return reappearance_counts / (len(seeds) - 1)
+
+
+def find_groups_with_seeds(
+    checkpoint_dir: str, seeds: list, ks: list, min_seeds: int = 2
+) -> Dict[Tuple[int, int], List[int]]:
+    """Return {(k, token_count): [seeds present]} for groups with >= min_seeds checkpoints."""
+    ckpt_dir = Path(checkpoint_dir)
+    pattern = re.compile(r"seed(\d+)_k(\d+)_tokens(\d+)\.pt")
+    seed_set = set(seeds)
+    k_set = set(ks)
+    seeds_by_group: Dict[Tuple[int, int], set] = {}
+
+    for f in ckpt_dir.glob("seed*_k*_tokens*.pt"):
+        m = pattern.match(f.name)
+        if not m:
+            continue
+        seed, k, tokens = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if seed not in seed_set or k not in k_set:
+            continue
+        seeds_by_group.setdefault((k, tokens), set()).add(seed)
+
+    return {
+        g: sorted(s)
+        for g, s in sorted(seeds_by_group.items())
+        if len(s) >= min_seeds
     }
-  ],
-  "metadata": {
-    "kernelspec": {
-      "display_name": "base",
-      "language": "python",
-      "name": "python3"
-    },
-    "language_info": {
-      "codemirror_mode": {
-        "name": "ipython",
-        "version": 3
-      },
-      "file_extension": ".py",
-      "mimetype": "text/x-python",
-      "name": "python",
-      "nbconvert_exporter": "python",
-      "pygments_lexer": "ipython3",
-      "version": "3.11.4"
-    }
-  },
-  "nbformat": 4,
-  "nbformat_minor": 5
-}
+
+
+def load_saes_at_group(checkpoint_dir: str, seeds: list, k: int, token_count: int) -> Dict[int, SparseAutoencoder]:
+    saes = {}
+    for seed in seeds:
+        path = Path(checkpoint_dir) / f"seed{seed}_k{k}_tokens{token_count}.pt"
+        ckpt = torch.load(path, map_location="cpu")
+        cfg = ckpt["config"]
+        sae = SparseAutoencoder(cfg["d_model"], cfg["n_features"], seed=seed)
+        sae.load_state_dict(ckpt["model_state_dict"])
+        saes[seed] = sae
+    return saes
+
+
+def main():
+    available = find_groups_with_seeds(CHECKPOINT_DIR, SEEDS, KS, min_seeds=MIN_SEEDS)
+
+    if not available:
+        print(f"No (k, token_count) group has >= {MIN_SEEDS} seeds among {SEEDS} x k={KS}.")
+        print("Re-run once more seeds/checkpoints have finished.")
+        return
+
+    print("Analyzing (k, token_count) groups (seeds used per group):")
+    for (k, t), seeds_here in available.items():
+        print(f"  k={k}, tokens={t:,}: {seeds_here}")
+    print()
+
+    results = []
+    for (k, token_count), seeds_here in available.items():
+        saes = load_saes_at_group(CHECKPOINT_DIR, seeds_here, k, token_count)
+        p_hat = compute_reappearance_probability(saes, theta=THETA)
+
+        stable = (p_hat >= (1 - EPSILON)).sum()
+        unstable = (p_hat <= EPSILON).sum()
+        discarded = len(p_hat) - stable - unstable
+
+        results.append({
+            "k": k,
+            "token_count": token_count,
+            "seeds": seeds_here,
+            "n_seeds": len(seeds_here),
+            "n_features": len(p_hat),
+            "mean_p_hat": p_hat.mean(),
+            "stable": stable,
+            "unstable": unstable,
+            "discarded": discarded,
+            "pct_stable": 100 * stable / len(p_hat),
+        })
+
+        print(f"--- k={k}, {token_count:,} tokens (seeds={seeds_here}) ---")
+        print(f"  Mean p_hat:  {p_hat.mean():.4f}")
+        print(f"  Stable:      {stable} ({100 * stable / len(p_hat):.1f}%)")
+        print(f"  Unstable:    {unstable} ({100 * unstable / len(p_hat):.1f}%)")
+        print(f"  Discarded:   {discarded} ({100 * discarded / len(p_hat):.1f}%)")
+        print()
+
+    print("=" * 84)
+    print("SUMMARY: stability vs. training token count, by k")
+    print("=" * 84)
+    print(f"{'k':>6} {'Tokens':>15} {'n_seeds':>8} {'Mean p_hat':>12} {'% Stable':>10} {'% Unstable':>12}")
+    for r in results:
+        print(
+            f"{r['k']:>6} {r['token_count']:>15,} {r['n_seeds']:>8} {r['mean_p_hat']:>12.4f} "
+            f"{r['pct_stable']:>9.1f}% {100 * r['unstable'] / r['n_features']:>11.1f}%"
+        )
+
+    # Save results for later use (e.g. plotting, or feeding into the classifier notebook)
+    Path("outputs").mkdir(exist_ok=True)
+    np.savez(
+        "outputs/stability_by_token_count.npz",
+        k=np.array([r["k"] for r in results]),
+        token_counts=np.array([r["token_count"] for r in results]),
+        n_seeds=np.array([r["n_seeds"] for r in results]),
+        mean_p_hat=np.array([r["mean_p_hat"] for r in results]),
+        pct_stable=np.array([r["pct_stable"] for r in results]),
+    )
+    print("\nSaved summary to outputs/stability_by_token_count.npz")
+
+    # Try to plot, if matplotlib is available and there's a display backend
+    try:
+        import matplotlib
+        matplotlib.use("Agg")  # headless-safe backend, saves to file instead of showing
+        import matplotlib.pyplot as plt
+
+        ks_present = sorted(set(r["k"] for r in results))
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        for k in ks_present:
+            rows = [r for r in results if r["k"] == k]
+            rows.sort(key=lambda r: r["token_count"])
+            token_counts = [r["token_count"] for r in rows]
+            pct_stable = [r["pct_stable"] for r in rows]
+            mean_p_hat = [r["mean_p_hat"] for r in rows]
+
+            axes[0].plot(token_counts, pct_stable, marker="o", label=f"k={k}")
+            axes[1].plot(token_counts, mean_p_hat, marker="o", label=f"k={k}")
+
+        axes[0].set_xscale("log")
+        axes[0].set_xlabel("Training tokens")
+        axes[0].set_ylabel("% features stable")
+        axes[0].set_title("Stability vs. training scale, by k")
+        axes[0].legend()
+
+        axes[1].set_xscale("log")
+        axes[1].set_xlabel("Training tokens")
+        axes[1].set_ylabel("Mean reappearance probability")
+        axes[1].set_title("Mean p_hat vs. training scale, by k")
+        axes[1].legend()
+
+        plt.tight_layout()
+        plt.savefig("outputs/stability_by_token_count.png", dpi=150)
+        print("Saved plot to outputs/stability_by_token_count.png")
+    except Exception as e:
+        print(f"(Skipped plotting: {e})")
+
+
+if __name__ == "__main__":
+    main()
