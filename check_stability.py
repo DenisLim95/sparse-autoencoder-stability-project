@@ -1,19 +1,3 @@
-# -*- coding: utf-8 -*-
-"""
-analyze_stability_by_tokens.py
-
-Loads the SAE checkpoints saved by prelim_experiments.py, grouped by (k, token
-count) across available seeds, and computes feature stability separately at
-each (k, token count) pair, so you can see how stability changes as training
-progresses AND how it varies with the TopK sparsity level.
-
-Updated for the TopK sweep: filenames now encode k (e.g.
-seed42_k64_tokens100000000.pt), and stability comparisons are only made
-within a fixed k — comparing across different k values would conflate
-"instability" with "different sparsity level," which is exactly the
-confound switching to TopK was meant to remove.
-"""
-
 import re
 import numpy as np
 import torch
