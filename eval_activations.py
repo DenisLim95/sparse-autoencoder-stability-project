@@ -141,10 +141,22 @@ def build_eval_activations(model_name: str, hook_point: str, device: str,
             break
 
     acts = torch.cat(batches, dim=0)
+    print(f"\nEval activations: {tuple(acts.shape)} ({acts.numel() * 4 / 1e9:.1f} GB)")
+
+    # Written through a temporary file and only then moved into place: at this size the write
+    # is the step most likely to fail, and a half-written .pt at the real path is worse than no
+    # cache at all, because the next run finds it, trusts it and dies loading it. A cache is an
+    # optimization, so a failure here costs recomputation rather than the run.
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
-    torch.save(acts, cache)
-    print(f"\nEval activations: {tuple(acts.shape)} "
-          f"({acts.numel() * 4 / 1e9:.1f} GB), cached at {cache}")
+    tmp = cache.with_suffix(".pt.partial")
+    try:
+        torch.save(acts, tmp)
+        tmp.replace(cache)
+        print(f"Cached at {cache}")
+    except Exception as e:
+        tmp.unlink(missing_ok=True)
+        print(f"Could not cache activations ({type(e).__name__}: {e}); "
+              f"continuing from memory, and the next run will rebuild them.")
 
     del model
     if device == "cuda":

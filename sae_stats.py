@@ -433,6 +433,28 @@ def discover(repo: str = DEFAULT_REPO, prefix: str = DEFAULT_PREFIX):
     return found
 
 
+def discover_all_prefixes(repo: str = DEFAULT_REPO):
+    """prefix -> {(k, seed, tokens): filename} for every prefix holding TopK checkpoints.
+
+    The objective tag carries the k sweep, so two models trained with different sweeps do not
+    share a prefix even at the same expansion and mitigations: the 70m run swept three k values
+    and tagged itself topk64-128-256, while a cross-scale run at a single k tags itself topk64.
+    A caller that assumes one tag across models therefore looks in the wrong place, which is
+    indistinguishable from the checkpoints not existing. This lets it look instead.
+    """
+    from huggingface_hub import HfApi
+
+    pattern = re.compile(r"checkpoints/(.+)/seed(\d+)_k(\d+)_tokens(\d+)\.pt")
+    prefixes = {}
+    for f in HfApi().list_repo_files(repo, repo_type="model"):
+        m = pattern.fullmatch(f)
+        if m:
+            prefix = m.group(1)
+            seed, k, tokens = (int(m.group(i)) for i in (2, 3, 4))
+            prefixes.setdefault(prefix, {})[(k, seed, tokens)] = f
+    return prefixes
+
+
 def complete_cells(found):
     """(k, tokens) cells that have every seed, plus the seed list and what was skipped.
 

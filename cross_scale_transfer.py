@@ -72,6 +72,7 @@ from sae_stats import (
     compute_single_run_statistics,
     cv_auroc,
     discover,
+    discover_all_prefixes,
     load_sae,
 )
 
@@ -106,8 +107,31 @@ class ModelGrid:
         self.hook_point = hook_point_for(name, REL_DEPTH)
         self.prefix = hub_prefix_for(name, OBJECTIVE_TAG, REL_DEPTH)
         self.found = discover(repo, self.prefix)
+        if not self.found:
+            self.prefix, self.found = self._resolve_prefix(repo)
         self.cells, self.seeds, self.skipped = complete_cells(self.found)
         self._cells = {}
+
+    def _resolve_prefix(self, repo):
+        """Find this model's checkpoints when the source's objective tag does not apply to it.
+
+        Only model-scoped prefixes are searched, so this can never silently reach into another
+        model's dictionaries; the unscoped legacy 70m path is reachable through the configured
+        tag alone. Ties break toward the most complete prefix, and the choice is printed,
+        because picking a tag is a decision about which SAEs are being compared.
+        """
+        layer = self.hook_point.split(".")[1]
+        scope = f"{self.name}_L{layer}_"
+        candidates = {p: f for p, f in discover_all_prefixes(repo).items() if p.startswith(scope)}
+        if not candidates:
+            return self.prefix, {}
+        prefix = max(candidates, key=lambda p: len(candidates[p]))
+        if len(candidates) > 1:
+            print(f"  {self.name}: {len(candidates)} objective tags present "
+                  f"({', '.join(sorted(candidates))}); using the most complete")
+        print(f"  {self.name}: objective tag {prefix[len(scope):]!r}, "
+              f"not the source's {OBJECTIVE_TAG!r}")
+        return prefix, candidates[prefix]
 
     def describe(self):
         budgets = sorted({t for _, t in self.cells})
