@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
 from pathlib import Path
 from tqdm.auto import tqdm
-from typing import Tuple, List, Dict
+from typing import Tuple, List, Dict, Optional
 from transformer_lens import HookedTransformer
 from datasets import load_dataset
 
@@ -32,14 +32,69 @@ CONFIG = {
     "hook_point": "blocks.3.hook_resid_post",  # Middle layer of Pythia-70m (6 layers, so layer 3)
     "d_model": 512,  # Pythia-70m hidden dimension
     "n_features": 2048,  # SAE dictionary size (4x expansion)
-    "l1_coeff": 1e-3,  # Sparsity coefficient
+    # How sparsity is imposed. "l1" is the objective every checkpoint on both Hub repos was
+    # trained under; "topk" keeps exactly the k largest latents per token. The L1 arm settled
+    # at L0 ~= 345 of 2048 features, i.e. 17% of the dictionary firing on every token, far
+    # denser than published SAEs. L1 cannot target an L0 -- you sweep the coefficient and see
+    # what you get, and each probe costs a full training run. TopK fixes L0 = k by
+    # construction, which is the only affordable way to reach a defensible sparsity on a
+    # machine that gets deleted on a deadline.
+    # `or` rather than a default, so a variable set to the empty string (easy to do in a
+    # notebook when clearing a setting) reads as unset instead of crashing on int("").
+    "sparsity": os.environ.get("SAE_SPARSITY") or "l1",  # "l1" | "topk"
+    "k": int(os.environ.get("SAE_TOPK_K") or 32),  # active latents per token, TopK only
+    # --- dead-latent mitigations (Gao et al. 2024, the two ingredients they name) ---------
+    # The first TopK run reached 60% dead latents and a median of zero firings per feature
+    # across 1.3M eval tokens, which does not merely waste capacity: a never-firing latent is
+    # labelled unstable automatically (its decoder row never left initialization, so nothing
+    # matches it) and has frequency exactly zero, so the classifier separates the classes by
+    # spotting corpses. That run scored AUROC 0.981, the highest of any, which is how we know
+    # the metric was measuring dictionary rot rather than predictability.
+    #
+    # tied_init: start each latent's encoder (read) direction parallel to its decoder (write)
+    # direction. Initialization only -- the two are free to diverge, unlike the permanently
+    # tied weights of Cunningham et al. 2023. Most of the death happened between step 200 and
+    # 400, before any latent had learned anything, which is the window this governs.
+    # auxk_coeff: weight on the auxiliary loss that lets dead latents reconstruct the residual
+    # error, so a latent frozen out of the top-k still receives gradient. 0 disables it.
+    "tied_init": (os.environ.get("SAE_TIED_INIT") or "").lower() not in ("0", "false")
+    if os.environ.get("SAE_TIED_INIT")
+    else os.environ.get("SAE_SPARSITY") == "topk",
+    "auxk_coeff": float(
+        os.environ.get("SAE_AUXK_COEFF")
+        if os.environ.get("SAE_AUXK_COEFF")
+        else (1.0 / 32 if os.environ.get("SAE_SPARSITY") == "topk" else 0.0)
+    ),
+    "auxk_k": int(os.environ.get("SAE_AUXK_K") or 512),  # dead latents entered per step
+    # A latent counts as dead once it has not fired for this many tokens (Gao et al. use 10M).
+    "auxk_dead_after_tokens": int(os.environ.get("SAE_AUXK_DEAD_AFTER") or 10_000_000),
+    # Every checkpoint on both Hub repos (1M through 8B, all seeds) was trained at 1.0 --
+    # verified from each checkpoint's saved config and cross-checked against the recorded
+    # losses. Resuming those checkpoints under a different coefficient would change the
+    # objective mid-curve, so this must stay at 1.0 unless the whole sweep is retrained.
+    #
+    # On units: the penalty is f.abs().mean(), which averages over the batch AND the feature
+    # dimension, while recon_loss averages over the batch and d_model. The usual convention
+    # sums over features, so in standard units this coefficient is really
+    # l1_coeff * d_model / n_features = 0.25 -- which is why 1.0 looks nothing like the ~1e-3
+    # in the literature. Do not switch the penalty to a sum without retraining the whole
+    # sweep, as that changes the objective every existing checkpoint was trained under. The
+    # side effect worth remembering: effective pressure scales as 1/n_features, so raising
+    # the dictionary size silently weakens sparsity too.
+    "l1_coeff": 1.0,  # Sparsity coefficient, L1 only
+    # L1 needs a unit-norm decoder or the penalty is gamed by shrinking the encoder and
+    # inflating the decoder, which is why decoder norm measured identically 1.000 with zero
+    # variance and therefore zero predictive value. TopK has no such term to game, so setting
+    # this False under TopK makes decoder norm a live predictor again. It changes two things
+    # at once though, so leave it True for the first L1-vs-TopK comparison.
+    "normalize_decoder": os.environ.get("SAE_NORMALIZE_DECODER", "1") != "0",
     "lr": 1e-3,
     "batch_size": 256,
     "seq_len": 128,
-    # Defaults to the three seeds with 1B checkpoints to resume from. The shared stream is
-    # paced by its least-trained seed, so a seed starting from zero would forfeit that head
-    # start -- hence 137 and 512 are excluded here and are better trained as a separate
-    # process (SAE_SEEDS=137,512) on another GPU, where they cost this run nothing.
+    # Only 42, 256 and 1024 have checkpoints above 100M. The shared stream is paced by its
+    # least-trained seed, so including 137 or 512 here drags the whole run back to the 100M
+    # milestone they share -- set SAE_SEEDS=42,256,1024 to resume the 1B-8B curve, and train
+    # the catch-up seeds as a separate process (SAE_SEEDS=137,512) where they cost it nothing.
     "seeds": [
         int(s) for s in os.environ.get("SAE_SEEDS", "42,137,256,512,1024").split(",") if s.strip()
     ],
@@ -48,6 +103,26 @@ CONFIG = {
 
 print(f"Using device: {CONFIG['device']}")
 print(f"Training seeds: {CONFIG['seeds']}")
+if CONFIG["sparsity"] == "topk":
+    print(f"Objective: TopK, k={CONFIG['k']} (L0 is exactly k by construction)")
+    print(f"  dead-latent mitigations: tied_init={CONFIG['tied_init']}, "
+          f"auxk_coeff={CONFIG['auxk_coeff']:g} "
+          f"(k_aux={CONFIG['auxk_k']}, dead after {CONFIG['auxk_dead_after_tokens']:,} tokens)")
+    if not CONFIG["tied_init"] or CONFIG["auxk_coeff"] == 0:
+        print("  WARNING: the unmitigated TopK run reached 60% dead latents and produced an "
+              "AUROC of 0.981 that was measuring dead features, not stability.")
+elif CONFIG["sparsity"] == "l1":
+    _lambda_std = CONFIG["l1_coeff"] * CONFIG["d_model"] / CONFIG["n_features"]
+    print(f"Objective: L1, l1_coeff={CONFIG['l1_coeff']:g} "
+          f"(= {_lambda_std:g} in sum-over-features units)")
+else:
+    raise SystemExit(f"Unknown CONFIG['sparsity']={CONFIG['sparsity']!r}; use 'l1' or 'topk'.")
+if not CONFIG["normalize_decoder"] and CONFIG["sparsity"] == "l1":
+    raise SystemExit(
+        "normalize_decoder=False with the L1 objective: the penalty is then trivially gamed "
+        "by shrinking the encoder and inflating the decoder, so the run would drift to a "
+        "meaningless solution. Unit-norm decoders are only optional under TopK."
+    )
 
 # Token budgets at which an SAE checkpoint is saved, so stability can be compared
 # across training scale. Roughly geometric: on a leased machine that gets deleted on a
@@ -57,12 +132,27 @@ CHECKPOINT_TOKENS = [
     1_000_000,
     50_000_000,
     100_000_000,
-    1_000_000_000,  # resume point; supplied by SAE_SEED_REPO rather than trained here
+    # Resume point for seeds 42/256/1024 only, supplied by SAE_SEED_REPO. Seeds 137 and 512
+    # have nothing above 100M, so a run including them resumes from there instead.
+    1_000_000_000,
     2_000_000_000,
     3_000_000_000,
     5_000_000_000,
     8_000_000_000,
 ]
+
+# Cap the run below the full curve, e.g. SAE_MAX_TOKENS=100000000 to stop at the 100M
+# milestone. The TopK arm only needs comparing against the L1 checkpoints at one matched
+# budget, so training it out to 8B would spend days of GPU time answering nothing extra.
+_max_tokens = int(os.environ.get("SAE_MAX_TOKENS") or 0)
+if _max_tokens:
+    _capped = [t for t in CHECKPOINT_TOKENS if t <= _max_tokens]
+    if not _capped:
+        raise SystemExit(
+            f"SAE_MAX_TOKENS={_max_tokens:,} is below the first milestone "
+            f"({min(CHECKPOINT_TOKENS):,}), so there would be nothing to checkpoint."
+        )
+    CHECKPOINT_TOKENS = _capped
 
 # Read-only repo to seed checkpoints from, e.g. SAE_SEED_REPO=ndasari/SAE_project. Lets a run
 # start from a collaborator's completed milestones; never uploaded to, so their repo is safe.
@@ -102,8 +192,40 @@ else:
         RESULTS_BASE = "outputs"
 
 _layer = CONFIG["hook_point"].split(".")[1]
-RUN_NAME = f"{CONFIG['model_name']}_L{_layer}_{max(CHECKPOINT_TOKENS) // 1_000_000_000}Btok"
+
+
+def _token_label(n: int) -> str:
+    return f"{n // 1_000_000_000}B" if n >= 1_000_000_000 else f"{n // 1_000_000}M"
+
+
+# The default full-curve L1 run keeps its original directory name byte-for-byte, so the 1M-8B
+# checkpoints already on both Hub repos still resolve. Anything that changes the objective
+# gets a suffix, which also stops two incomparable families of checkpoints being written into
+# the same directory and silently resumed from each other.
+_objective_tag = "" if CONFIG["sparsity"] == "l1" else f"_topk{CONFIG['k']}"
+if not CONFIG["normalize_decoder"]:
+    _objective_tag += "_freedec"
+# Tagged even though these default on for TopK, because the first TopK run predates them and
+# its 60%-dead checkpoints are sitting in ..._topk32. Without a distinct name the fixed run
+# would resume from them and inherit exactly the rot it exists to remove.
+if CONFIG["tied_init"]:
+    _objective_tag += "_tied"
+if CONFIG["auxk_coeff"]:
+    _objective_tag += "_auxk"
+RUN_NAME = (
+    f"{CONFIG['model_name']}_L{_layer}"
+    f"_{_token_label(max(CHECKPOINT_TOKENS))}tok{_objective_tag}"
+)
 OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
+
+# Hub paths are scoped by objective for the same reason the local directory is, and it matters
+# more here: SAE_HF_REPO is both the upload and the download location, so without this a TopK
+# run would pull the L1 checkpoints out of the shared repo into its own directory and then
+# refuse to resume from them -- a configuration mistake that presents as a crash. The default
+# L1 run keeps the original flat prefixes so every file already on the Hub still resolves.
+_hub_scope = f"/{_objective_tag.lstrip('_')}" if _objective_tag else ""
+HUB_CHECKPOINT_PREFIX = f"checkpoints{_hub_scope}"
+HUB_RESULTS_PREFIX = f"results{_hub_scope}"
 CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
 CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -196,19 +318,27 @@ def activation_stream_generator(model, dataset_name: str, hook_point: str, seq_l
 
 class SparseAutoencoder(nn.Module):
     """
-    Standard Sparse Autoencoder with ReLU activation and L1 sparsity penalty.
+    Sparse Autoencoder with either an L1 penalty or a TopK activation.
 
     Architecture:
-        encoder: x -> ReLU(W_enc @ (x - b_dec) + b_enc)
+        encoder: x -> ReLU(W_enc @ (x - b_dec) + b_enc)      [sparsity="l1"]
+                 x -> ReLU(TopK_k(W_enc @ (x - b_dec) + b_enc))  [sparsity="topk"]
         decoder: f -> W_dec @ f + b_dec
+
+    Under "l1" sparsity is a soft penalty added to the loss and the resulting L0 is whatever
+    the coefficient happens to produce. Under "topk" at most k latents are non-zero by
+    construction and no sparsity term enters the loss at all.
     """
 
-    def __init__(self, d_model: int, n_features: int, seed: int):
+    def __init__(self, d_model: int, n_features: int, seed: int,
+                 sparsity: str = "l1", k: int = 32, tied_init: bool = False):
         super().__init__()
         torch.manual_seed(seed)
 
         self.d_model = d_model
         self.n_features = n_features
+        self.sparsity = sparsity
+        self.k = min(k, n_features)
 
         # Encoder weights and bias
         self.W_enc = nn.Parameter(torch.randn(d_model, n_features) * 0.01)
@@ -221,36 +351,97 @@ class SparseAutoencoder(nn.Module):
         # Initialize decoder columns to unit norm
         with torch.no_grad():
             self.W_dec.data = F.normalize(self.W_dec.data, dim=1)
+            if tied_init:
+                # Copy decoder -> encoder, not the reverse, so the unit norms just established
+                # survive. A latent then reads along the same direction it writes, so the very
+                # first time it wins the top-k it contributes something useful instead of
+                # noise, which is what keeps it in contention long enough to learn.
+                self.W_enc.data = self.W_dec.data.t().contiguous().clone()
+
+    def _encode_with_pre(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Return (sparse activations, dense pre-activations). The auxiliary loss needs the
+        pre-activations of latents the top-k threw away, which `encode` cannot expose."""
+        x_centered = x - self.b_dec
+        pre_acts = x_centered @ self.W_enc + self.b_enc
+        selected = pre_acts
+        if self.sparsity == "topk":
+            # Select on the pre-activations, then rectify. Taking the top k of an already
+            # rectified vector would pick arbitrary features out of the zeros whenever fewer
+            # than k are positive, inventing activations that carry no signal.
+            idx = pre_acts.topk(self.k, dim=-1).indices
+            keep = torch.zeros_like(pre_acts, dtype=torch.bool).scatter_(-1, idx, True)
+            selected = torch.where(keep, pre_acts, torch.zeros_like(pre_acts))
+        return F.relu(selected), pre_acts
 
     def encode(self, x: torch.Tensor) -> torch.Tensor:
         """Encode input to sparse feature activations."""
-        x_centered = x - self.b_dec
-        pre_acts = x_centered @ self.W_enc + self.b_enc
-        return F.relu(pre_acts)
+        return self._encode_with_pre(x)[0]
 
     def decode(self, f: torch.Tensor) -> torch.Tensor:
         """Decode feature activations back to input space."""
         return f @ self.W_dec + self.b_dec
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def auxk_loss(self, x, x_hat, pre_acts, dead_mask, k_aux):
+        """Gao et al.'s AuxK: let the currently-dead latents try to explain the main model's
+        reconstruction error. A latent that keeps losing the top-k competition otherwise
+        receives no gradient at all and stays dead permanently; here it gets one."""
+        zero = x.new_zeros(())
+        if dead_mask is None:
+            return zero
+        n_dead = int(dead_mask.sum())
+        k = min(int(k_aux), n_dead)
+        if k == 0:
+            return zero
+
+        # Only dead latents compete, so the live ones cannot crowd them out again.
+        dead_acts = F.relu(pre_acts).masked_fill(~dead_mask, 0.0)
+        idx = dead_acts.topk(k, dim=-1).indices
+        keep = torch.zeros_like(dead_acts, dtype=torch.bool).scatter_(-1, idx, True)
+        z = torch.where(keep, dead_acts, torch.zeros_like(dead_acts))
+
+        # Deliberately no b_dec: the dead latents have to explain the residual themselves, and
+        # adding the bias back in is a well-known way to get this silently wrong.
+        e_hat = z @ self.W_dec
+        # The residual is a target, not something to optimize. Detaching stops the auxiliary
+        # term from making its own job easier by degrading the main reconstruction.
+        e = (x - x_hat).detach()
+        aux = F.mse_loss(e_hat, e)
+        # Reported to go non-finite occasionally; zeroing one step beats losing the run.
+        return aux if torch.isfinite(aux) else zero
+
+    def forward(self, x: torch.Tensor, dead_mask: Optional[torch.Tensor] = None,
+                k_aux: int = 512) -> Tuple[torch.Tensor, torch.Tensor, dict]:
         """
         Forward pass returning reconstruction, features, and loss components.
+
+        Args:
+            dead_mask: Boolean mask over features marking latents that have not fired
+                recently. None (the default, so analysis code is unaffected) skips the
+                auxiliary loss entirely.
+            k_aux: How many dead latents to enter into the auxiliary reconstruction.
 
         Returns:
             x_hat: Reconstructed input
             f: Feature activations
-            loss_dict: Dictionary with reconstruction and sparsity losses
+            loss_dict: Dictionary with reconstruction, sparsity, and auxiliary losses
         """
-        f = self.encode(x)
+        f, pre_acts = self._encode_with_pre(x)
         x_hat = self.decode(f)
 
         # Reconstruction loss (MSE)
         recon_loss = F.mse_loss(x_hat, x)
 
-        # Sparsity loss (L1 on feature activations)
+        # L1 magnitude of the code. Always reported so the training curves stay comparable
+        # across objectives, but only added to the loss when sparsity="l1" -- under TopK the
+        # constraint is structural and penalising magnitude on top of it would just shrink
+        # the k surviving activations.
         sparsity_loss = f.abs().mean()
 
-        return x_hat, f, {"recon_loss": recon_loss, "sparsity_loss": sparsity_loss}
+        return x_hat, f, {
+            "recon_loss": recon_loss,
+            "sparsity_loss": sparsity_loss,
+            "aux_loss": self.auxk_loss(x, x_hat, pre_acts, dead_mask, k_aux),
+        }
 
     def normalize_decoder(self):
         """Normalize decoder columns to unit norm (call after each optimization step)."""
@@ -278,6 +469,7 @@ def empty_history() -> Dict[str, list]:
         "total_loss": [],
         "l0": [],
         "dead_frac": [],
+        "aux_loss": [],
     }
 
 
@@ -330,7 +522,8 @@ def rolling_checkpoint_name(seeds) -> str:
     return "shared_latest_seeds" + "-".join(str(s) for s in sorted(seeds)) + ".pt"
 
 
-def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path, seeds=None):
+def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path, seeds=None,
+                                 prefix: str = "checkpoints"):
     """Pull any milestone checkpoints already on the Hub into the local checkpoint dir.
 
     Leased GPU machines get replaced, and the replacement arrives with an empty disk. Since
@@ -338,12 +531,13 @@ def restore_checkpoints_from_hub(repo_id: str, checkpoint_dir: Path, seeds=None)
     them here means a run continues on a new machine instead of restarting from zero.
 
     Restricted to `seeds` when given, so seeding from a collaborator's repo doesn't drag down
-    checkpoints for seeds this run isn't training.
+    checkpoints for seeds this run isn't training. `prefix` scopes the search to one
+    objective's subdirectory, so a run never restores weights trained under a different one.
     """
     from huggingface_hub import HfApi, hf_hub_download
 
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    pattern = re.compile(r"checkpoints/seed(\d+)_tokens\d+\.pt")
+    pattern = re.compile(rf"{re.escape(prefix)}/seed(\d+)_tokens\d+\.pt")
     try:
         remote = []
         for f in HfApi().list_repo_files(repo_id, repo_type="model"):
@@ -408,6 +602,7 @@ def load_shared_resume_state(checkpoint_dir: Path, seeds: list, checkpoint_token
             "models": {s: c["model_state_dict"] for s, c in ckpts.items()},
             "optimizers": {s: c["optimizer_state_dict"] for s, c in ckpts.items()},
             "histories": {s: c.get("history", empty_history()) for s, c in ckpts.items()},
+            "config": next(iter(ckpts.values())).get("config", {}),
         }
     return None
 
@@ -420,6 +615,8 @@ def train_saes_shared_stream(
     checkpoint_dir,
     hf_repo_id=None,
     seed_repo_id=None,
+    hub_checkpoint_prefix="checkpoints",
+    hub_results_prefix="results",
     checkpoint_every_seconds=CHECKPOINT_EVERY_SECONDS,
     log_every_steps=LOG_EVERY_STEPS,
 ):
@@ -444,7 +641,11 @@ def train_saes_shared_stream(
 
     # Each __init__ reseeds the RNG before drawing, so construction order doesn't matter.
     saes = {
-        s: SparseAutoencoder(config["d_model"], config["n_features"], seed=s).to(device)
+        s: SparseAutoencoder(
+            config["d_model"], config["n_features"], seed=s,
+            sparsity=config["sparsity"], k=config["k"],
+            tied_init=config["tied_init"],
+        ).to(device)
         for s in seeds
     }
     optimizers = {s: torch.optim.Adam(saes[s].parameters(), lr=config["lr"]) for s in seeds}
@@ -460,12 +661,16 @@ def train_saes_shared_stream(
         # with a warning and the run would silently persist nothing off-box. Fail loudly
         # here instead: if the mirror cannot work, better to know before training starts.
         hf_api.create_repo(hf_repo_id, repo_type="model", private=True, exist_ok=True)
-        restore_checkpoints_from_hub(hf_repo_id, checkpoint_dir, seeds)
+        restore_checkpoints_from_hub(
+            hf_repo_id, checkpoint_dir, seeds, prefix=hub_checkpoint_prefix
+        )
 
     # Second, so our own further-along checkpoints win: restore only fetches what is missing.
     if seed_repo_id is not None:
         print(f"Seeding from collaborator repo hf.co/{seed_repo_id} (read-only)")
-        restore_checkpoints_from_hub(seed_repo_id, checkpoint_dir, seeds)
+        restore_checkpoints_from_hub(
+            seed_repo_id, checkpoint_dir, seeds, prefix=hub_checkpoint_prefix
+        )
 
     def mirror_to_hub(path: Path, path_in_repo: str):
         if hf_api is None:
@@ -484,10 +689,51 @@ def train_saes_shared_stream(
 
     resume = load_shared_resume_state(checkpoint_dir, seeds, checkpoint_tokens)
     if resume is not None:
+        # Resuming under a different objective than the checkpoints were trained with would
+        # silently put a discontinuity in the middle of the scaling curve, and nothing
+        # downstream could detect it. Refuse rather than produce unattributable numbers.
+        prior = resume.get("config", {})
+        # Checkpoints written before the sparsity flag existed are all L1, so absence means
+        # "l1" rather than "unknown" -- treating it as unknown would let a TopK run silently
+        # resume from L1 weights.
+        prior_sparsity = prior.get("sparsity", "l1")
+        mismatches = []
+        if prior_sparsity != config["sparsity"]:
+            mismatches.append(("sparsity", prior_sparsity, config["sparsity"]))
+        elif prior_sparsity == "topk":
+            if prior.get("k") is not None and prior["k"] != config["k"]:
+                mismatches.append(("k", prior["k"], config["k"]))
+        elif prior.get("l1_coeff") is not None and prior["l1_coeff"] != config["l1_coeff"]:
+            mismatches.append(("l1_coeff", prior["l1_coeff"], config["l1_coeff"]))
+        prior_norm = prior.get("normalize_decoder", True)
+        if prior_norm != config["normalize_decoder"]:
+            mismatches.append(("normalize_decoder", prior_norm, config["normalize_decoder"]))
+        # The auxiliary loss changes what is being optimized, so switching it mid-run splits
+        # the curve in two. tied_init is deliberately not checked: it only affects step 0, and
+        # on resume the weights come from the checkpoint regardless.
+        prior_auxk = prior.get("auxk_coeff", 0.0)
+        if prior_auxk != config["auxk_coeff"]:
+            mismatches.append(("auxk_coeff", prior_auxk, config["auxk_coeff"]))
+        if mismatches:
+            detail = "; ".join(f"{k}: checkpoint={p!r} vs CONFIG={c!r}" for k, p, c in mismatches)
+            raise SystemExit(
+                f"Refusing to resume, the objective would change mid-run ({detail}). Either "
+                f"match CONFIG to the checkpoints, or train from scratch into an empty "
+                f"checkpoint directory -- each objective gets its own directory, so this "
+                f"usually means two runs were pointed at the same one."
+            )
         for s in seeds:
             saes[s].load_state_dict(resume["models"][s])
             optimizers[s].load_state_dict(resume["optimizers"][s])
-            histories[s] = resume["histories"].get(s, empty_history())
+            restored = resume["histories"].get(s, empty_history())
+            # Checkpoints written before a curve existed lack its key, and the logging code
+            # appends to every key unconditionally. Pad with NaN so the new series lines up
+            # with the old steps on the x-axis instead of being silently shifted left.
+            for key in empty_history():
+                restored.setdefault(
+                    key, [float("nan")] * len(restored.get("tokens_seen", []))
+                )
+            histories[s] = restored
         tokens_seen = resume["tokens_seen"]
         step = resume.get("step", 0)
         print(f"Resumed all {len(seeds)} seeds at {tokens_seen:,} tokens")
@@ -503,11 +749,17 @@ def train_saes_shared_stream(
 
     # Accumulate curve metrics as on-device tensors and only pull them to the host at
     # logging time; calling .item() every step would force a GPU sync 244k times.
-    interval_sums = {s: torch.zeros(4, device=device) for s in seeds}  # recon, sparsity, total, l0
+    # recon, sparsity, total, l0, aux
+    interval_sums = {s: torch.zeros(5, device=device) for s in seeds}
     interval_n = 0
     seen_active = {
         s: torch.zeros(config["n_features"], dtype=torch.bool, device=device) for s in seeds
     }
+    # Tokens since each latent last fired, which is how AuxK decides what counts as dead.
+    # Deliberately not checkpointed: it rebuilds itself within auxk_dead_after_tokens (about
+    # 300 steps), which is short next to the gap between milestones, and starting from zero
+    # only means the auxiliary loss stays off for that brief window after a restart.
+    tokens_idle = {s: torch.zeros(config["n_features"], device=device) for s in seeds}
     last_checkpoint_time = time.time()
 
     def build_seed_state(seed):
@@ -536,20 +788,35 @@ def train_saes_shared_stream(
             with open(checkpoint_dir.parent / f"training_history_seed{s}.json", "w") as fh:
                 json.dump(histories[s], fh)
 
+    # Zero under TopK, where sparsity is structural rather than penalised. Kept as a weight
+    # rather than a branch so the loss and the logged l1_term cannot disagree about it.
+    l1_weight = config["l1_coeff"] if config["sparsity"] == "l1" else 0.0
+    unit_norm_decoder = config["normalize_decoder"]
+    auxk_coeff = config["auxk_coeff"]
+    auxk_k = config["auxk_k"]
+    dead_after = config["auxk_dead_after_tokens"]
+
     for batch in activation_stream:
         batch = batch.to(device, non_blocking=True)
 
         for s in seeds:
             sae, optimizer = saes[s], optimizers[s]
-            x_hat, f, loss_dict = sae(batch)
-            loss = loss_dict["recon_loss"] + config["l1_coeff"] * loss_dict["sparsity_loss"]
+            # Built from the previous steps' firing history, so it reflects what was dead on
+            # arrival at this batch rather than what this batch happens to leave out.
+            dead_mask = tokens_idle[s] > dead_after if auxk_coeff else None
+            x_hat, f, loss_dict = sae(batch, dead_mask=dead_mask, k_aux=auxk_k)
+            loss = loss_dict["recon_loss"] + l1_weight * loss_dict["sparsity_loss"]
+            if auxk_coeff:
+                loss = loss + auxk_coeff * loss_dict["aux_loss"]
 
             optimizer.zero_grad()
             loss.backward()
-            with torch.no_grad():
-                sae.W_dec.grad = remove_parallel_component(sae.W_dec.data, sae.W_dec.grad)
+            if unit_norm_decoder:
+                with torch.no_grad():
+                    sae.W_dec.grad = remove_parallel_component(sae.W_dec.data, sae.W_dec.grad)
             optimizer.step()
-            sae.normalize_decoder()
+            if unit_norm_decoder:
+                sae.normalize_decoder()
 
             with torch.no_grad():
                 active = f > 0
@@ -557,7 +824,13 @@ def train_saes_shared_stream(
                 interval_sums[s][1] += loss_dict["sparsity_loss"].detach()
                 interval_sums[s][2] += loss.detach()
                 interval_sums[s][3] += active.float().sum(dim=1).mean()
-                seen_active[s] |= active.any(dim=0)
+                interval_sums[s][4] += loss_dict["aux_loss"].detach()
+                fired = active.any(dim=0)
+                seen_active[s] |= fired
+                tokens_idle[s] = torch.where(
+                    fired, torch.zeros_like(tokens_idle[s]),
+                    tokens_idle[s] + batch.shape[0],
+                )
 
         # batch is already the flattened (batch_size * seq_len, d_model) activations
         # from activation_stream_generator -- batch.shape[0] IS the real token count
@@ -569,16 +842,17 @@ def train_saes_shared_stream(
         if step % log_every_steps == 0:
             l0s, recons = [], []
             for s in seeds:
-                recon, sparsity, total, l0 = (interval_sums[s] / interval_n).tolist()
+                recon, sparsity, total, l0, aux = (interval_sums[s] / interval_n).tolist()
                 dead_frac = 1.0 - seen_active[s].float().mean().item()
                 h = histories[s]
                 h["step"].append(step)
                 h["tokens_seen"].append(tokens_seen)
                 h["recon_loss"].append(recon)
                 h["sparsity_loss"].append(sparsity)
-                h["l1_term"].append(config["l1_coeff"] * sparsity)
+                h["l1_term"].append(l1_weight * sparsity)
                 h["total_loss"].append(total)
                 h["l0"].append(l0)
+                h["aux_loss"].append(aux)
                 # Dead = never fired anywhere in this logging window.
                 h["dead_frac"].append(dead_frac)
                 l0s.append(l0)
@@ -590,11 +864,23 @@ def train_saes_shared_stream(
             interval_n = 0
             worst_dead = max(100 * histories[s]["dead_frac"][-1] for s in seeds)
             mean_sparsity = np.mean([histories[s]["sparsity_loss"][-1] for s in seeds])
+            # Under TopK the penalty is not in the loss, so reporting a weighted term would
+            # be a column of zeros; show the raw code magnitude instead.
+            sparsity_col = (f"l1_term {l1_weight * mean_sparsity:.5f}" if l1_weight
+                            else f"|f|_1 {mean_sparsity:.5f}")
+            # dead% is the headline number to watch under TopK: it climbed to 60% by 100M
+            # tokens without these mitigations, and aux shows whether the revival term is
+            # actually doing anything (it is exactly 0 while no latent has been idle long
+            # enough to qualify, which is expected early on).
+            aux_col = ""
+            if auxk_coeff:
+                mean_aux = np.mean([histories[s]["aux_loss"][-1] for s in seeds])
+                aux_col = f" | aux {mean_aux:.5f}"
             print(f"step {step:>7} | {tokens_seen:>14,} tok | "
                   f"recon {np.mean(recons):.5f} | "
-                  f"l1_term {config['l1_coeff'] * mean_sparsity:.5f} | "
+                  f"{sparsity_col} | "
                   f"L0 {np.mean(l0s):6.1f} ({min(l0s):.0f}-{max(l0s):.0f}) | "
-                  f"dead {worst_dead:5.1f}%")
+                  f"dead {worst_dead:5.1f}%{aux_col}")
 
         if time.time() - last_checkpoint_time >= checkpoint_every_seconds:
             save_checkpoint_atomic(build_shared_state(), checkpoint_dir / rolling_checkpoint_name(seeds))
@@ -608,13 +894,13 @@ def train_saes_shared_stream(
                 ckpt_name = f"seed{s}_tokens{milestone}.pt"
                 ckpt_path = checkpoint_dir / ckpt_name
                 save_checkpoint_atomic(build_seed_state(s), ckpt_path)
-                mirror_to_hub(ckpt_path, f"checkpoints/{ckpt_name}")
+                mirror_to_hub(ckpt_path, f"{hub_checkpoint_prefix}/{ckpt_name}")
 
             save_checkpoint_atomic(build_shared_state(), checkpoint_dir / rolling_checkpoint_name(seeds))
             write_histories()
             for s in seeds:
                 name = f"training_history_seed{s}.json"
-                mirror_to_hub(checkpoint_dir.parent / name, f"results/{name}")
+                mirror_to_hub(checkpoint_dir.parent / name, f"{hub_results_prefix}/{name}")
 
             print(f"milestone reached: all {len(seeds)} seeds checkpointed at "
                   f"{milestone:,} tokens -- runnable through stability_check.py now"
@@ -647,19 +933,26 @@ trained_saes, training_histories = train_saes_shared_stream(
     checkpoint_dir=CHECKPOINT_DIR,
     hf_repo_id=HF_REPO_ID,
     seed_repo_id=SEED_REPO_ID,
+    hub_checkpoint_prefix=HUB_CHECKPOINT_PREFIX,
+    hub_results_prefix=HUB_RESULTS_PREFIX,
 )
 
 print(f"\nTrained {len(trained_saes)} SAEs with seeds: {list(trained_saes.keys())}")
 print(f"Checkpoints saved at token counts: {CHECKPOINT_TOKENS}")
 
-"""### 3b. Training curves — is l1_coeff too large?
+"""### 3b. Training curves — did the sparsity setting land somewhere usable?
 
-`l1_coeff` is 1.0 here, three orders of magnitude above the 1e-3 used for the earlier
-1M/10M runs, so these curves are the check on whether the sparsity penalty is dominating.
-The warning signs, in order of how conclusive they are: the dead-feature fraction climbing
-toward 100%, L0 collapsing toward 0, and the weighted L1 term sitting far above the
-reconstruction term. Any of those means most features are being pushed to zero and the SAE
-is buying sparsity at the cost of reconstructing anything.
+Under the L1 objective the question is whether the penalty is dominating. The warning signs,
+in order of how conclusive they are: the dead-feature fraction climbing toward 100%, L0
+collapsing toward 0, and the weighted L1 term sitting far above the reconstruction term. Any
+of those means most features are being pushed to zero and the SAE is buying sparsity at the
+cost of reconstructing anything. Note that `l1_coeff = 1.0` is not comparable to the ~1e-3
+quoted in papers: the penalty here is averaged over features rather than summed, so in the
+usual units it is `l1_coeff * d_model / n_features = 0.25`.
+
+Under TopK there is no coefficient to get wrong, because L0 is exactly k. The failure mode
+moves to dead features, which TopK strands far more readily than L1 does, and which corrupt
+the stability analysis rather than merely wasting capacity — see the diagnostic below.
 """
 
 
@@ -684,13 +977,28 @@ def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_pat
     anchor_seed = list(histories.keys())[0]
     h = histories[anchor_seed]
     axes[0, 1].plot(h["tokens_seen"], h["recon_loss"], label="reconstruction")
-    axes[0, 1].plot(h["tokens_seen"], h["l1_term"], label=f"l1_coeff x L1 ({config['l1_coeff']:g})")
+    if config["sparsity"] == "topk":
+        # l1_term is identically zero under TopK and would plot as nothing on a log axis.
+        axes[0, 1].plot(h["tokens_seen"], h["sparsity_loss"], label="mean |f| (unpenalized)")
+        axes[0, 1].set_title(f"Reconstruction vs code magnitude (seed {anchor_seed})")
+    else:
+        axes[0, 1].plot(h["tokens_seen"], h["l1_term"],
+                        label=f"l1_coeff x L1 ({config['l1_coeff']:g})")
+        axes[0, 1].set_title(f"Loss terms compared (seed {anchor_seed})")
+    # Only worth a line once some latent has actually been idle long enough to qualify as
+    # dead; before that the series is a flat zero that a log axis cannot draw.
+    _aux = np.asarray(h.get("aux_loss") or [], dtype=float)
+    if config["auxk_coeff"] and np.any(_aux > 0):
+        axes[0, 1].plot(h["tokens_seen"], config["auxk_coeff"] * _aux,
+                        label=f"auxk_coeff x AuxK ({config['auxk_coeff']:g})")
     axes[0, 1].set_yscale("log")
     axes[0, 1].set_ylabel("Loss term")
-    axes[0, 1].set_title(f"Loss terms compared (seed {anchor_seed})")
 
     axes[1, 0].set_ylabel("L0 (mean active features/token)")
-    axes[1, 0].set_title("Sparsity: L0 -> 0 means over-penalized")
+    axes[1, 0].set_title(
+        f"Sparsity: L0 should sit at k={config['k']}" if config["sparsity"] == "topk"
+        else "Sparsity: L0 -> 0 means over-penalized"
+    )
 
     axes[1, 1].set_ylabel("Dead features (%)")
     axes[1, 1].set_ylim(0, 100)
@@ -706,6 +1014,37 @@ def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_pat
         print(f"Saved training curves to {save_path}")
     plt.show()
 
+    if config["sparsity"] == "topk":
+        print(f"\n=== TopK k={config['k']} diagnostic (final logging window) ===")
+        for seed, h in histories.items():
+            print(f"  seed {seed}: L0={h['l0'][-1]:.1f} (target {config['k']}), "
+                  f"dead={100 * h['dead_frac'][-1]:.1f}%, recon={h['recon_loss'][-1]:.5f}")
+        worst_dead = max(100 * h["dead_frac"][-1] for h in histories.values())
+        if worst_dead > 20:
+            live = config["n_features"] * (1 - worst_dead / 100)
+            print(f"\n  WARNING: up to {worst_dead:.1f}% of features never fired in the last "
+                  f"logging window, leaving about {live:.0f} of {config['n_features']} live. "
+                  f"TopK strands latents this way: one that loses the top-k competition gets "
+                  f"no gradient and cannot recover on its own. This matters for the result and "
+                  f"not just for capacity -- a dead feature's decoder row stays near "
+                  f"initialization, so nothing matches it and it is labelled unstable, while "
+                  f"its activation frequency is exactly zero, so the classifier can separate "
+                  f"the classes by detecting corpses.")
+            if config["auxk_coeff"] and config["tied_init"]:
+                print(f"  Both mitigations are already on (tied init, auxk_coeff="
+                      f"{config['auxk_coeff']:g}), so this level of death means they were not "
+                      f"enough here: try a larger k, a smaller dictionary, or a higher "
+                      f"auxk_coeff. The MIN_FIRINGS floor below keeps the AUROC honest either "
+                      f"way, at the cost of scoring a smaller dictionary.")
+            else:
+                print(f"  Enable the mitigations before trusting any of this: "
+                      f"SAE_TIED_INIT=1 SAE_AUXK_COEFF=0.03125 (currently tied_init="
+                      f"{config['tied_init']}, auxk_coeff={config['auxk_coeff']:g}).")
+        else:
+            print(f"\n  Dead fraction at most {worst_dead:.1f}%; the dictionary is in use and "
+                  f"L0 is pinned at k by construction, so there is no sparsity to tune.")
+        return
+
     print(f"\n=== l1_coeff = {config['l1_coeff']:g} diagnostic (final logging window) ===")
     for seed, h in histories.items():
         ratio = h["l1_term"][-1] / h["recon_loss"][-1] if h["recon_loss"][-1] > 0 else float("inf")
@@ -717,8 +1056,9 @@ def plot_training_curves(histories: Dict[int, Dict[str, list]], config, save_pat
     if worst_dead > 90 or lowest_l0 < 1:
         print(f"\n  WARNING: up to {worst_dead:.1f}% of features dead and L0 as low as "
               f"{lowest_l0:.2f}. l1_coeff={config['l1_coeff']:g} looks too large -- the SAE is "
-              f"collapsing to the trivial all-zero solution. Consider 1e-3 (the value used "
-              f"for the 1M/10M runs).")
+              f"collapsing to the trivial all-zero solution. Lowering it is only valid for a "
+              f"sweep retrained from scratch; every existing checkpoint was trained at 1.0 and "
+              f"resuming one under a different coefficient is refused on purpose.")
     else:
         print(f"\n  L0 and dead-feature fraction look non-degenerate at "
               f"l1_coeff={config['l1_coeff']:g}.")
@@ -953,45 +1293,107 @@ print(f"Eval activations shape: {activations.shape}")
 # batched accumulation, peak GPU usage ~32 MB
 STAT_BATCH = 4096  # reduce to 1024 if still OOM
 
-n_total = len(activations)
-freq_accum = torch.zeros(CONFIG["n_features"])
-mean_accum = torch.zeros(CONFIG["n_features"])
 
-with torch.no_grad():
-    for start in tqdm(range(0, n_total, STAT_BATCH), desc="Computing feature stats"):
-        batch = activations[start : start + STAT_BATCH].to(CONFIG["device"])
-        feats = reference_sae.encode(batch)               # (B, n_features)
-        freq_accum += (feats > 0).float().sum(dim=0).cpu()
-        mean_accum += feats.sum(dim=0).cpu()
+# A conditional statistic estimated from a handful of firings is mostly sampling noise: at 10
+# firings the mean carries roughly +/-30% error, and a latent that never fires has no
+# conditional mean to speak of. Features below this floor get NaN for every conditional
+# statistic and are dropped from the classifier, rather than being handed a fabricated 0.0
+# that the classifier can then use to identify them.
+MIN_FIRINGS = int(os.environ.get("SAE_MIN_FIRINGS") or 100)
 
-activation_freq = (freq_accum / n_total).numpy()
-mean_activation  = (mean_accum  / n_total).numpy()
+
+def compute_activation_stats(sae, activations, device, batch_size=STAT_BATCH, desc="feature stats"):
+    """Firing rate and firing strength for every feature of a single SAE.
+
+    Returns mean activation conditioned on the feature firing. The unconditional mean --
+    the sum of activations divided by ALL tokens -- is identically
+    (firing rate) x (conditional mean), so using it as a predictor alongside activation
+    frequency would double-count frequency rather than contribute anything new.
+
+    Returns (activation_freq, mean_activation, firing_counts). The raw counts come back
+    because they, not the rate, determine whether the conditional statistics mean anything.
+    """
+    n_total = len(activations)
+    freq_accum = torch.zeros(sae.n_features)
+    sum_accum = torch.zeros(sae.n_features)
+
+    with torch.no_grad():
+        for start in tqdm(range(0, n_total, batch_size), desc=f"Computing {desc}"):
+            batch = activations[start : start + batch_size].to(device)
+            feats = sae.encode(batch)               # (B, n_features)
+            freq_accum += (feats > 0).float().sum(dim=0).cpu()
+            sum_accum += feats.sum(dim=0).cpu()
+
+    firing_counts = freq_accum.numpy()
+    activation_freq = firing_counts / max(n_total, 1)
+    enough = firing_counts >= MIN_FIRINGS
+    mean_activation = np.divide(
+        sum_accum.numpy(), firing_counts,
+        out=np.full(sae.n_features, np.nan), where=enough,
+    )
+    return activation_freq, mean_activation, firing_counts
+
+
+activation_freq, mean_activation, firing_counts = compute_activation_stats(
+    reference_sae, activations, CONFIG["device"], desc="reference-seed feature stats"
+)
+
+# Whether this eval set is large enough is decided by the rarest features, not the average
+# one. At L0 ~346/2048 the typical feature fires on ~17% of tokens and is pinned down to
+# several significant figures here; only a substantial low-count tail would justify the
+# streaming rewrite that reaching the intended 100M tokens requires (the eval set is
+# materialized as one tensor, so 100M tokens would be ~205 GB).
+print(f"\n=== Is {len(activations):,} eval tokens enough? (frequency estimate quality) ===")
+for _thresh in (1, 10, 100, 1000):
+    _n = int((firing_counts < _thresh).sum())
+    print(f"  features firing < {_thresh:5,} times: {_n:5d} "
+          f"({_n / len(activation_freq):5.1%}) -- relative error >~ {100 / max(_thresh, 1) ** 0.5:.0f}%")
+print(f"  median firings per feature: {np.median(firing_counts):,.0f}")
+print(f"  never fire at all: {int((firing_counts == 0).sum())} "
+      f"({(firing_counts == 0).mean():.1%})")
+print(f"  below the MIN_FIRINGS={MIN_FIRINGS} floor, so excluded from the classifier: "
+      f"{int((firing_counts < MIN_FIRINGS).sum())} "
+      f"({(firing_counts < MIN_FIRINGS).mean():.1%})")
 
 # Compare stable vs unstable
 print("=== Stable Features (n={}) ===".format(len(stable_indices)))
 print(f"  Decoder norm:      mean={decoder_norms[stable_indices].mean():.3f}, std={decoder_norms[stable_indices].std():.3f}")
 print(f"  Activation freq:   mean={activation_freq[stable_indices].mean():.4f}, std={activation_freq[stable_indices].std():.4f}")
-print(f"  Mean activation:   mean={mean_activation[stable_indices].mean():.4f}, std={mean_activation[stable_indices].std():.4f}")
+print(f"  Mean act (|firing): mean={np.nanmean(mean_activation[stable_indices]):.4f}, std={np.nanstd(mean_activation[stable_indices]):.4f}")
 
 print("\n=== Unstable Features (n={}) ===".format(len(unstable_indices)))
 print(f"  Decoder norm:      mean={decoder_norms[unstable_indices].mean():.3f}, std={decoder_norms[unstable_indices].std():.3f}")
 print(f"  Activation freq:   mean={activation_freq[unstable_indices].mean():.4f}, std={activation_freq[unstable_indices].std():.4f}")
-print(f"  Mean activation:   mean={mean_activation[unstable_indices].mean():.4f}, std={mean_activation[unstable_indices].std():.4f}")
+print(f"  Mean act (|firing): mean={np.nanmean(mean_activation[unstable_indices]):.4f}, std={np.nanstd(mean_activation[unstable_indices]):.4f}")
 
 def safe_hist(ax, values, bins, **kwargs):
-    """hist() that tolerates constant data.
+    """hist() that tolerates effectively-constant data.
 
-    normalize_decoder() pins every decoder norm to exactly 1.0, so the decoder-norm
-    histogram has zero range and matplotlib raises "Too many bins for data range".
-    That would abort the script after training has already finished, so degrade to a
-    single bin instead of losing the whole analysis to a plotting detail.
+    normalize_decoder() pins every decoder norm to 1.0, so the decoder-norm histogram has no
+    usable range and matplotlib raises "Too many bins for data range". That would abort the
+    script after training has already finished, so degrade to a single bar instead of losing
+    the whole analysis to a plotting detail.
+
+    The test is relative, not a fixed epsilon. Renormalizing every step leaves norms that
+    differ in the last few bits rather than being bit-identical: a span around 1e-7 at values
+    around 1.0, which clears any small absolute threshold while still being far too narrow to
+    cut into 30 distinct float32 bin edges. An absolute cutoff therefore passes runs where the
+    norms happen to land exactly equal and crashes ones where they do not, which is a
+    coin-flip on the arithmetic rather than a property of the data.
     """
-    values = np.asarray(values)
+    values = np.asarray(values, dtype=np.float64).ravel()
+    values = values[np.isfinite(values)]
     if values.size == 0:
         return
-    lo, hi = float(np.min(values)), float(np.max(values))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi - lo < 1e-12:
-        ax.hist(values, bins=1, range=(lo - 0.5, lo + 0.5), **kwargs)
+    lo, hi = float(values.min()), float(values.max())
+    # Scaled by the data's own magnitude with no floor, so a predictor that genuinely varies
+    # over a narrow range near zero still gets binned properly instead of being flattened
+    # along with the decoder norms.
+    scale = max(abs(lo), abs(hi))
+    # Below this the bars are indistinguishable on screen anyway, so one bar is the honest
+    # rendering as well as the numerically safe one.
+    if hi - lo <= 1e-6 * scale:
+        ax.hist(values, bins=1, range=(lo - 0.5, hi + 0.5), **kwargs)
     else:
         ax.hist(values, bins=bins, **kwargs)
 
@@ -1215,10 +1617,10 @@ def compute_geometric_isolation(sae: SparseAutoencoder, k: int = 10) -> np.ndarr
 def compute_reconstruction_contribution(
     sae: SparseAutoencoder,
     activations: torch.Tensor,
-    batch_size: int = 1024,
-    n_samples: int = 10000,
+    batch_size: int = 8192,
+    n_samples: Optional[int] = None,
     device: str = "cuda"
-) -> np.ndarray:
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Compute reconstruction contribution for each feature.
 
@@ -1226,72 +1628,168 @@ def compute_reconstruction_contribution(
     HIGH value = feature is important for reconstruction (more likely stable)
     LOW value = feature is redundant (less stable)
 
+    Ablating a feature perturbs only the tokens where it was active, so averaging the MSE
+    increase over ALL sampled tokens gives (firing rate) x (impact while firing). That is
+    mechanically proportional to activation frequency, which is separately one of our
+    predictors -- so the unconditional form cannot be used to argue that reconstruction
+    contribution adds anything beyond frequency. The conditional mean, taken over firing
+    tokens only, is the part that is not already frequency. Both are returned so the size of
+    the overlap can be reported rather than assumed.
+
     Returns:
-        contributions: (n_features,) array of reconstruction contributions
+        conditional:   (n_features,) mean MSE increase over tokens where the feature fired
+        unconditional: (n_features,) mean MSE increase over all sampled tokens
+        active_counts: (n_features,) how many tokens the conditional mean averages over
     """
     sae.eval()
     n_features = sae.n_features
+    d_model = sae.d_model
 
-    # Use a subset of activations for speed
-    sample_indices = np.random.choice(len(activations), min(n_samples, len(activations)), replace=False)
-    sample_acts = activations[sample_indices].to(device)
+    # Defaults to the whole eval set. Subsampling made sense when this ablated features one
+    # at a time, but the closed form below costs one matmul per batch, and using the same
+    # tokens as compute_activation_stats means a single firing floor governs every conditional
+    # statistic instead of each estimator having its own effective threshold.
+    if n_samples is None or n_samples >= len(activations):
+        sample_acts = activations
+    else:
+        sample_indices = np.random.choice(len(activations), n_samples, replace=False)
+        sample_acts = activations[sample_indices]
 
-    contributions = np.zeros(n_features)
+    print(f"Computing reconstruction contributions for {n_features} features "
+          f"over {len(sample_acts):,} tokens...")
 
-    print(f"Computing reconstruction contributions for {n_features} features...")
+    delta_sums = torch.zeros(n_features, dtype=torch.float64, device=device)
+    active_counts = torch.zeros(n_features, dtype=torch.float64, device=device)
+    n_total = len(sample_acts)
 
     with torch.no_grad():
-        # Get baseline reconstruction error
-        features = sae.encode(sample_acts)
-        baseline_recon = sae.decode(features)
-        baseline_mse = F.mse_loss(baseline_recon, sample_acts, reduction='none').mean(dim=1)
+        dec_sq_norms = sae.W_dec.pow(2).sum(dim=1)  # (n_features,), 1.0 under normalize_decoder
 
-        # For each feature, compute MSE when that feature is ablated
-        for feat_idx in tqdm(range(n_features)):
-            # Zero out this feature
-            ablated_features = features.clone()
-            ablated_features[:, feat_idx] = 0
+        # Zeroing feature j shifts the residual by exactly -f_j * W_dec[j], so the change in
+        # per-token MSE has a closed form and every feature can be done in one matmul. This
+        # is identical to ablating features one at a time, without the 2048 decode passes.
+        for start in tqdm(range(0, n_total, batch_size), desc="Ablation (closed form)"):
+            x = sample_acts[start : start + batch_size].to(device)
+            f = sae.encode(x)
+            residual = sae.decode(f) - x
+            cross = residual @ sae.W_dec.T  # (B, n_features)
+            delta = (f.pow(2) * dec_sq_norms - 2.0 * f * cross) / d_model
 
-            # Reconstruct
-            ablated_recon = sae.decode(ablated_features)
-            ablated_mse = F.mse_loss(ablated_recon, sample_acts, reduction='none').mean(dim=1)
+            delta_sums += delta.sum(dim=0).double()
+            active_counts += (f > 0).sum(dim=0).double()
 
-            # Contribution = increase in MSE when feature is removed
-            contribution = (ablated_mse - baseline_mse).mean().cpu().item()
-            contributions[feat_idx] = contribution
+    delta_sums = delta_sums.cpu().numpy()
+    active_counts = active_counts.cpu().numpy()
 
-    return contributions
+    unconditional = delta_sums / max(n_total, 1)
+    # delta is exactly zero wherever the feature did not fire, so the running sum over all
+    # tokens already equals the sum over firing tokens.
+    conditional = np.divide(
+        delta_sums, active_counts,
+        out=np.full_like(delta_sums, np.nan), where=active_counts >= MIN_FIRINGS,
+    )
+    return conditional, unconditional, active_counts
 
-# Compute all four statistics
+def compute_encoder_stats(sae):
+    """Encoder-side single-run statistics.
+
+    Everything else here describes the decoder or the activations it produces, but the
+    encoder is what actually decides whether a feature fires: b_enc is literally the
+    activation threshold, and the encoder column norm sets how sharply the feature responds.
+    Both are free to read off the weights and neither is constrained by normalize_decoder.
+    """
+    enc = sae.W_enc.detach()  # (d_model, n_features)
+    return enc.norm(dim=0).cpu().numpy(), sae.b_enc.detach().cpu().numpy()
+
+
+def compute_single_run_statistics(sae, activations, device, k=10, n_samples=None, label=""):
+    """Every predictor available from ONE SAE, with no reference to any other seed.
+
+    Returned as a dict so the same code path can produce the reference seed's statistics and
+    a held-out seed's, guaranteeing the two are computed identically.
+    """
+    suffix = f" ({label})" if label else ""
+    print(f"Computing geometric isolation{suffix}...")
+    isolation = compute_geometric_isolation(sae, k=k)
+
+    print(f"Computing activation statistics{suffix}...")
+    freq, mean_act, counts = compute_activation_stats(
+        sae, activations, device, desc=f"activation stats{suffix}"
+    )
+
+    print(f"Computing reconstruction contribution{suffix}...")
+    recon_cond, recon_uncond, _ = compute_reconstruction_contribution(
+        sae, activations, n_samples=n_samples, device=device
+    )
+
+    enc_norm, enc_bias = compute_encoder_stats(sae)
+
+    return {
+        "activation_freq": freq,
+        "mean_activation": mean_act,
+        "firing_counts": counts,
+        "geometric_isolation": isolation,
+        "recon_contribution": recon_cond,
+        "recon_contribution_uncond": recon_uncond,
+        "encoder_norm": enc_norm,
+        "encoder_bias": enc_bias,
+        "decoder_norm": sae.W_dec.detach().cpu().norm(dim=1).numpy(),
+    }
+
+
 print("Computing geometric isolation...")
 geometric_isolation = compute_geometric_isolation(reference_sae, k=10)
 
 print("\nComputing reconstruction contribution...")
-recon_contribution = compute_reconstruction_contribution(
+recon_contribution, recon_contribution_uncond, _ = compute_reconstruction_contribution(
     reference_sae,
     activations,
-    n_samples=10000,
     device=CONFIG["device"]
 )
 
-print("\nDone! All four statistics computed.")
+encoder_norm, encoder_bias = compute_encoder_stats(reference_sae)
+
+# How much of each statistic is really just activation frequency wearing a different hat.
+# The unconditional ablation is (firing rate) x (impact while firing) by construction, so a
+# near-1.0 correlation there is expected and is the reason the conditional form is used
+# instead; anything else near 1.0 would mean that predictor is not independent evidence.
+print("\n=== Frequency confound check (Spearman rho vs activation frequency) ===")
+from scipy.stats import spearmanr
+
+for _name, _values in [
+    ("recon contribution (conditional, used)", recon_contribution),
+    ("recon contribution (unconditional)", recon_contribution_uncond),
+    ("mean activation | firing", mean_activation),
+    ("geometric isolation", geometric_isolation),
+    ("encoder column norm", encoder_norm),
+    ("encoder bias", encoder_bias),
+]:
+    # omit rather than propagate: the conditional statistics are NaN below the firing floor,
+    # and dropping those features is exactly the comparison we want anyway.
+    _rho = spearmanr(activation_freq, _values, nan_policy="omit").statistic
+    _n = int(np.isfinite(_values).sum())
+    print(f"  {_name:42s}: rho={_rho:+.3f} (n={_n})")
+
+print("\nDone! All predictors computed.")
 
 # Compare all four statistics between stable and unstable features
 print("=" * 60)
 print("COMPARISON OF ALL FOUR STABILITY PREDICTORS")
 print("=" * 60)
 
+# nan-aware throughout: the conditional statistics are NaN below the MIN_FIRINGS floor, and
+# a plain mean() would turn one under-measured feature into a NaN for the whole group.
 print("\n=== Stable Features (n={}) ===".format(len(stable_indices)))
 print(f"  1. Activation freq:        mean={activation_freq[stable_indices].mean():.4f}, std={activation_freq[stable_indices].std():.4f}")
 print(f"  2. Decoder norm:           mean={decoder_norms[stable_indices].mean():.4f}, std={decoder_norms[stable_indices].std():.4f}")
 print(f"  3. Geometric isolation:    mean={geometric_isolation[stable_indices].mean():.4f}, std={geometric_isolation[stable_indices].std():.4f}")
-print(f"  4. Recon contribution:     mean={recon_contribution[stable_indices].mean():.6f}, std={recon_contribution[stable_indices].std():.6f}")
+print(f"  4. Recon contribution:     mean={np.nanmean(recon_contribution[stable_indices]):.6f}, std={np.nanstd(recon_contribution[stable_indices]):.6f}")
 
 print("\n=== Unstable Features (n={}) ===".format(len(unstable_indices)))
 print(f"  1. Activation freq:        mean={activation_freq[unstable_indices].mean():.4f}, std={activation_freq[unstable_indices].std():.4f}")
 print(f"  2. Decoder norm:           mean={decoder_norms[unstable_indices].mean():.4f}, std={decoder_norms[unstable_indices].std():.4f}")
 print(f"  3. Geometric isolation:    mean={geometric_isolation[unstable_indices].mean():.4f}, std={geometric_isolation[unstable_indices].std():.4f}")
-print(f"  4. Recon contribution:     mean={recon_contribution[unstable_indices].mean():.6f}, std={recon_contribution[unstable_indices].std():.6f}")
+print(f"  4. Recon contribution:     mean={np.nanmean(recon_contribution[unstable_indices]):.6f}, std={np.nanstd(recon_contribution[unstable_indices]):.6f}")
 
 # Compute effect sizes (difference in means / pooled std)
 print("\n=== Effect Sizes (Cohen's d) ===")
@@ -1305,9 +1803,9 @@ for name, values in [
     unstable_vals = values[unstable_indices]
 
     # Cohen's d
-    pooled_std = np.sqrt((stable_vals.std()**2 + unstable_vals.std()**2) / 2)
+    pooled_std = np.sqrt((np.nanstd(stable_vals)**2 + np.nanstd(unstable_vals)**2) / 2)
     if pooled_std > 0:
-        cohens_d = (stable_vals.mean() - unstable_vals.mean()) / pooled_std
+        cohens_d = (np.nanmean(stable_vals) - np.nanmean(unstable_vals)) / pooled_std
     else:
         cohens_d = 0
 
@@ -1341,23 +1839,82 @@ from sklearn.model_selection import cross_val_score, StratifiedKFold
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import roc_auc_score, classification_report, confusion_matrix
 
-# Only train on features with a definite label (exclude the discarded middle)
-labeled_mask = stable_mask | unstable_mask
+# Only train on features with a definite label (exclude the discarded middle) AND enough
+# firings for their statistics to mean anything.
+#
+# The floor is not bookkeeping, it decides what the AUROC measures. A latent that never fires
+# is labelled unstable automatically -- its decoder row never moved from initialization, so no
+# feature in another seed matches it -- and it has activation frequency exactly zero, an
+# encoder bias still at its init value, and no conditional statistics at all. Leave those in
+# and the classifier scores well by detecting corpses, which is a claim about how thoroughly
+# the dictionary died, not about whether stability is predictable in advance. The first TopK
+# run was 60% dead and returned the highest AUROC of any run, 0.981, which is the symptom.
+live_mask = firing_counts >= MIN_FIRINGS
+labeled_mask = (stable_mask | unstable_mask) & live_mask
 
-X = np.column_stack([
-    activation_freq,
-    geometric_isolation,
-    recon_contribution,
-    mean_activation,
-])[labeled_mask]
+_dropped = (stable_mask | unstable_mask) & ~live_mask
+print(f"\n=== Firing floor (MIN_FIRINGS={MIN_FIRINGS} over {len(activations):,} eval tokens) ===")
+print(f"  labelled features below the floor, dropped: {int(_dropped.sum())} "
+      f"({_dropped.sum() / max((stable_mask | unstable_mask).sum(), 1):.1%} of labelled)")
+print(f"    of which labelled stable:   {int((_dropped & stable_mask).sum())}")
+print(f"    of which labelled unstable: {int((_dropped & unstable_mask).sum())}")
+if _dropped.any() and (_dropped & unstable_mask).sum() / max(_dropped.sum(), 1) > 0.9:
+    print("  NOTE: the dropped features are almost entirely 'unstable', which is the "
+          "confound this floor exists to remove -- they were separable on frequency alone.")
+
+# Firing rates and activation magnitudes are heavy-tailed over several orders of magnitude,
+# and logistic regression fits a boundary that is linear in whatever it is handed. Left in
+# raw units, the multivariable model can recruit the other predictors purely to bend the
+# frequency response, which would show up as those predictors "adding signal" when they are
+# only supplying curvature. Note this does NOT change any single-predictor AUROC: one
+# logistic regression coefficient is monotone in its input, AUROC depends only on ranking,
+# and a log is monotone. It only makes the multivariable comparison honest.
+LOG_EPS = 1e-10
+
+
+def build_predictors(stats):
+    """(name, values) for every predictor, from one SAE's statistics dict.
+
+    Single code path so the reference seed and any held-out seed are guaranteed to be
+    described by identically constructed columns in identical order.
+    """
+    return [
+        ("Activation Freq (log)", np.log10(stats["activation_freq"] + LOG_EPS)),
+        ("Geometric Isolation", stats["geometric_isolation"]),
+        ("Recon Contribution", stats["recon_contribution"]),
+        ("Mean Activation (log)", np.log10(stats["mean_activation"] + LOG_EPS)),
+        ("Encoder Norm", stats["encoder_norm"]),
+        ("Encoder Bias", stats["encoder_bias"]),
+    ]
+
+
+reference_stats = {
+    "activation_freq": activation_freq,
+    "mean_activation": mean_activation,
+    "firing_counts": firing_counts,
+    "geometric_isolation": geometric_isolation,
+    "recon_contribution": recon_contribution,
+    "encoder_norm": encoder_norm,
+    "encoder_bias": encoder_bias,
+}
+
+PREDICTORS = build_predictors(reference_stats)
+feature_names = [name for name, _ in PREDICTORS]
+log_activation_freq = dict(PREDICTORS)["Activation Freq (log)"]
+
+X = np.column_stack([values for _, values in PREDICTORS])[labeled_mask]
 
 y = stable_mask[labeled_mask].astype(int)
 
 print(f"Features excluded from classifier training (discarded middle): {middle_mask.sum()}")
+print(f"Features excluded from classifier training (below firing floor): {int(_dropped.sum())}")
 print(f"Features used for classifier training: {labeled_mask.sum()}")
-
-# Feature names for interpretation
-feature_names = ["Activation Freq", "Geometric Isolation", "Recon Contribution", "Mean Activation"]
+if not np.isfinite(X).all():
+    raise SystemExit(
+        "Non-finite values reached the feature matrix. The firing floor is supposed to "
+        "remove every feature whose conditional statistics are NaN, so this means a "
+        "predictor is NaN for some reason other than too few firings."
+    )
 
 print(f"Feature matrix shape: {X.shape}")
 print(f"Label distribution: {y.sum()} stable, {len(y) - y.sum()} unstable")
@@ -1405,12 +1962,7 @@ print("SINGLE-FEATURE CLASSIFIERS (Isolated Effects)")
 print("-" * 60)
 
 single_feature_results = {}
-for name, values in [
-    ("Activation Freq", activation_freq),
-    ("Geometric Isolation", geometric_isolation),
-    ("Recon Contribution", recon_contribution),
-    ("Mean Activation", mean_activation),
-]:
+for name, values in PREDICTORS:
     values_labeled = values[labeled_mask]
     X_single = values_labeled.reshape(-1, 1)
     X_single_scaled = StandardScaler().fit_transform(X_single)
@@ -1431,7 +1983,7 @@ print("COMBINED CLASSIFIERS")
 print("-" * 60)
 
 # Frequency + Geometric isolation
-X_freq_geom = np.column_stack([activation_freq, geometric_isolation])[labeled_mask]
+X_freq_geom = np.column_stack([log_activation_freq, geometric_isolation])[labeled_mask]
 X_fg_scaled = StandardScaler().fit_transform(X_freq_geom)
 clf_fg = LogisticRegression(class_weight='balanced', random_state=42)
 fg_auroc = cross_val_score(clf_fg, X_fg_scaled, y, cv=cv, scoring='roc_auc')
@@ -1449,7 +2001,7 @@ for i, name in enumerate(feature_names):
     print(f"      Without {name}: {ablated_auroc.mean():.3f} (drop: {drop:+.3f})")
 
 # Full model
-print(f"\n   Full Model (All 4 Features):")
+print(f"\n   Full Model ({len(feature_names)} predictors):")
 print(f"      AUROC: {auroc_scores.mean():.3f} (+/- {auroc_scores.std() * 2:.3f})")
 
 # Summary
@@ -1465,3 +2017,158 @@ if auroc_scores.mean() >= 0.75:
     print("\nHypothesis 1 SUPPORTED: AUROC >= 0.75")
 else:
     print(f"\nHypothesis 1 NOT YET SUPPORTED: AUROC = {auroc_scores.mean():.3f} < 0.75")
+
+"""## 11. Does the headline number survive its own methodology choices?
+
+Four checks, each aimed at a way the AUROC above could be an artifact of a labelling or
+measurement decision rather than a property of the SAE:
+
+  1. Endpoint binarization discards the ambiguous middle, which removes the hardest cases
+     before scoring. Re-run over ALL features under p_hat >= 0.5 to size that effect.
+  2. Many-to-one matching lets several anchor features claim one partner, so a crowded
+     region could read as stable. Re-derive the labels with one-to-one Hungarian matching
+     and see whether geometric isolation's predictive power moves with them.
+  3. Cross-validation holds out features from the SAME dictionary, and geometric isolation
+     is relational -- a feature's value depends on neighbours that may sit in the training
+     fold. Train on the reference seed and test on a different seed's dictionary entirely.
+  4. Barely-firing latents are trivially separable (frequency ~0, decoder row still at
+     initialization, so nothing matches them and they are labelled unstable by default).
+     Sweep the firing floor to see how much of the headline number they were carrying.
+"""
+
+print("\n" + "=" * 60)
+print("ROBUSTNESS OF THE EVALUATION ITSELF")
+print("=" * 60)
+
+
+def cv_auroc(values, labels, mask):
+    """Cross-validated AUROC under the shared protocol, for any predictor set and labelling."""
+    cols = values if values.ndim == 2 else values.reshape(-1, 1)
+    X_local = StandardScaler().fit_transform(cols[mask])
+    y_local = labels[mask].astype(int)
+    if len(np.unique(y_local)) < 2:
+        return float("nan")
+    model = LogisticRegression(class_weight="balanced", random_state=42, max_iter=1000)
+    return cross_val_score(model, X_local, y_local, cv=cv, scoring="roc_auc").mean()
+
+
+X_all = np.column_stack([values for _, values in PREDICTORS])
+
+# --- 1. how much does discarding the ambiguous middle flatter the result? ---
+print("\n1. Effect of discarding the ambiguous middle")
+# Both arms are restricted to features above the firing floor, so this isolates the effect of
+# the binarization rule. Letting the p_hat >= 0.5 arm keep the under-measured features would
+# confound the two exclusions and make the comparison unreadable.
+all_mask = live_mask.copy()
+midpoint_labels = reappearance_probs >= 0.5
+endpoint_auroc = cv_auroc(X_all, stable_mask, labeled_mask)
+midpoint_auroc = cv_auroc(X_all, midpoint_labels, all_mask)
+print(f"   endpoint only  (n={labeled_mask.sum():4d}, the reported figure): {endpoint_auroc:.3f}")
+print(f"   all features   (n={all_mask.sum():4d}, p_hat >= 0.5)           : {midpoint_auroc:.3f}")
+print(f"   inflation attributable to discarding {int((middle_mask & live_mask).sum())} "
+      f"middle features: {endpoint_auroc - midpoint_auroc:+.3f}")
+
+# --- 2. do the labels, and isolation's power over them, depend on the matching rule? ---
+print("\n2. Effect of the matching rule (many-to-one vs one-to-one)")
+from scipy.optimize import linear_sum_assignment
+
+_seeds = list(trained_saes.keys())
+_anchor_sae = trained_saes[_seeds[0]]
+_hungarian_counts = np.zeros(_anchor_sae.n_features)
+for _other in _seeds[1:]:
+    _sim = compute_decoder_similarity(_anchor_sae, trained_saes[_other]).numpy()
+    _rows, _cols = linear_sum_assignment(-_sim)
+    _assigned = np.full(_anchor_sae.n_features, -1.0)
+    _assigned[_rows] = _sim[_rows, _cols]
+    _hungarian_counts += (_assigned >= THETA).astype(float)
+
+hungarian_probs = _hungarian_counts / max(len(_seeds) - 1, 1)
+hungarian_stable = hungarian_probs >= (1 - EPSILON)
+hungarian_labeled = (hungarian_stable | (hungarian_probs <= EPSILON)) & live_mask
+
+print(f"   stable fraction  many-to-one: {stable_mask.mean():6.1%}   "
+      f"one-to-one: {hungarian_stable.mean():6.1%}")
+print(f"   labels changed by switching rule: "
+      f"{int((stable_mask != hungarian_stable).sum())} of {len(stable_mask)} features")
+_iso = geometric_isolation
+print(f"   geometric isolation alone, many-to-one labels: "
+      f"{cv_auroc(_iso, stable_mask, labeled_mask):.3f}")
+print(f"   geometric isolation alone, one-to-one labels : "
+      f"{cv_auroc(_iso, hungarian_stable, hungarian_labeled):.3f}")
+print(f"   full model,                one-to-one labels : "
+      f"{cv_auroc(X_all, hungarian_stable, hungarian_labeled):.3f}")
+print("   (a large gap here would mean isolation is tracking the matcher, not stability)")
+
+# --- 3. does the classifier transfer to a dictionary it was not trained on? ---
+print("\n3. Transfer to a held-out dictionary (the deployment claim)")
+if len(_seeds) < 3:
+    print("   Needs >=3 seeds: the held-out seed must itself have two comparisons. Skipped.")
+else:
+    held_out_seed = _seeds[1]
+    # Same budget, same eval activations, same code path -- only the dictionary differs, so a
+    # drop here is transfer failure and not a difference in training budget or in measurement.
+    held_out_saes = {held_out_seed: trained_saes[held_out_seed]}
+    held_out_saes.update({s: trained_saes[s] for s in _seeds if s != held_out_seed})
+    held_out_probs, _ = compute_reappearance_probability(held_out_saes, theta=THETA)
+    held_out_stable = held_out_probs >= (1 - EPSILON)
+
+    held_out_stats = compute_single_run_statistics(
+        trained_saes[held_out_seed], activations, CONFIG["device"],
+        label=f"seed {held_out_seed}",
+    )
+    X_held = np.column_stack([v for _, v in build_predictors(held_out_stats)])
+    # The floor has to be re-derived from THIS dictionary's firing counts: which latents are
+    # under-measured is a property of the SAE being tested, not of the one trained on.
+    held_out_live = held_out_stats["firing_counts"] >= MIN_FIRINGS
+    held_out_mask = (held_out_stable | (held_out_probs <= EPSILON)) & held_out_live
+    print(f"   held-out seed {held_out_seed}: {int(held_out_live.sum())} of "
+          f"{len(held_out_live)} latents above the firing floor")
+
+    transfer_clf = LogisticRegression(class_weight="balanced", random_state=42, max_iter=1000)
+    transfer_scaler = StandardScaler().fit(X_all[labeled_mask])
+    transfer_clf.fit(transfer_scaler.transform(X_all[labeled_mask]), stable_mask[labeled_mask])
+
+    held_truth = held_out_stable[held_out_mask].astype(int)
+
+    # Two ways to normalize the held-out dictionary, which answer different questions.
+    # Reusing the training scaler also requires the raw scales to agree across dictionaries;
+    # refitting on the held-out SAE asks only whether the learned relationship transfers,
+    # and matches what a practitioner would do with an SAE in hand.
+    transfer_auroc = roc_auc_score(held_truth, transfer_clf.predict_proba(
+        transfer_scaler.transform(X_held[held_out_mask]))[:, 1])
+    refit_auroc = roc_auc_score(held_truth, transfer_clf.predict_proba(
+        StandardScaler().fit(X_held[held_out_live]).transform(X_held[held_out_mask]))[:, 1])
+
+    print(f"   trained on seed {_seeds[0]}, tested on seed {held_out_seed} "
+          f"(n={held_out_mask.sum()}, {held_truth.sum()} stable)")
+    print(f"   within-dictionary (cross-validated)     : {endpoint_auroc:.3f}")
+    print(f"   held-out, training-set scaler           : {transfer_auroc:.3f}")
+    print(f"   held-out, rescaled on the held-out SAE  : {refit_auroc:.3f}")
+    print(f"   transfer cost (rescaled)                : {refit_auroc - endpoint_auroc:+.3f}")
+    print("   (the held-out number is the one that supports 'use this on an SAE you did "
+          "not train')")
+
+# --- 4. how much of the AUROC was carried by latents that barely fire? ---
+print("\n4. Sensitivity to the firing floor")
+# Undefined conditional statistics are imputed with 0.0 here, reproducing what the code did
+# before the floor existed. That imputation is the mechanism under suspicion: a never-firing
+# latent gets frequency ~0, mean activation 0, contribution 0, and is labelled unstable
+# because its untrained decoder row matches nothing, so those four values in combination
+# identify it perfectly without saying anything about predictability.
+_imputed_stats = dict(reference_stats)
+for _key in ("mean_activation", "recon_contribution"):
+    _imputed_stats[_key] = np.nan_to_num(reference_stats[_key], nan=0.0)
+X_imputed = np.column_stack([v for _, v in build_predictors(_imputed_stats)])
+
+_definite = stable_mask | unstable_mask
+print(f"   {'floor':>6}  {'n':>5}  {'% of dict':>9}  {'% stable':>8}  {'AUROC':>6}")
+for _floor in (0, 1, 10, 100, 1000):
+    _m = _definite & (firing_counts >= _floor)
+    if _m.sum() < 20 or len(np.unique(stable_mask[_m])) < 2:
+        print(f"   {_floor:>6}  {int(_m.sum()):>5}  too few features left to score")
+        continue
+    print(f"   {_floor:>6}  {int(_m.sum()):>5}  {(firing_counts >= _floor).mean():>8.1%}  "
+          f"{stable_mask[_m].mean():>7.1%}  {cv_auroc(X_imputed, stable_mask, _m):>6.3f}")
+print(f"   the reported figure uses floor={MIN_FIRINGS}. A number that falls steeply as the "
+      f"floor rises\n   was being carried by under-trained latents rather than by predictable "
+      f"structure.")

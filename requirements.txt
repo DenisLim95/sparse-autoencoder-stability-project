@@ -1,0 +1,30 @@
+# Dependencies for prelim_experiments_update.py and prelim_experiments_update.ipynb.
+#   pip install -r requirements.txt
+#
+# Nothing is pinned. That is deliberate for torch above all: an unpinned requirement is
+# satisfied by whatever build is already installed, so pip leaves the CUDA-matched wheel that
+# ships on a GPU image untouched, while still installing torch on a machine that has none.
+# Pinning it would risk replacing a working GPU build with one that cannot see the device.
+#
+# google.colab is not listed: it exists only on Colab and the script guards that import.
+
+transformer-lens
+transformers
+datasets
+huggingface_hub
+
+# The Pile shards are .jsonl.zst, and fsspec only registers the zstd codec when this import
+# succeeds. Without it, streaming the dataset dies on "Compression type zstd not supported"
+# from inside the producer thread -- after the model has loaded, so it looks like a training
+# failure rather than a missing package. Colab ships it preinstalled, which is why the earlier
+# runs never needed it listed.
+zstandard
+
+numpy
+pandas
+scipy
+scikit-learn
+matplotlib
+tqdm
+
+torch
