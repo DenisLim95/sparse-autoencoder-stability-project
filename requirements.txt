@@ -8,7 +8,9 @@
 #
 # google.colab is not listed: it exists only on Colab and the script guards that import.
 
-transformer-lens
+# Capped below 4: TransformerLens 4.0 removed HookedTransformer, which eval_activations.py and
+# both sweep scripts load the model through. 3.7.2 is the version these runs were made with.
+transformer-lens<4
 transformers
 datasets
 huggingface_hub
