@@ -358,18 +358,35 @@ print(f"  hook {CONFIG['hook_point']} = layer {_LAYER} of {_N_LAYERS} "
 
 
 def activation_stream_generator(model, dataset_name: str, hook_point: str, seq_len: int,
-                                batch_size: int, device: str):
+                                batch_size: int, device: str, skip: dict | None = None):
     """
-    Infinite generator yielding (batch_size * seq_len, d_model) activation tensors.
-    Re-tokenizes and streams fresh Pile text; does not pre-collect a fixed n_tokens.
-    Calling this function again (e.g. for the eval set) starts a fresh read from the
-    beginning of the streaming dataset, so every arm and seed sees the same data in the
+    Infinite generator yielding (activations, docs_consumed) pairs, where activations is a
+    (batch_size * seq_len, d_model) tensor and docs_consumed counts the dataset documents
+    read so far. Re-tokenizes and streams fresh Pile text; does not pre-collect a fixed
+    n_tokens. Calling this function again (e.g. for the eval set) starts a fresh read from
+    the beginning of the streaming dataset, so every arm and seed sees the same data in the
     same order -- only the SAE's own k and initialization differ.
+
+    `skip` is a mutable holder read when iteration begins, not when the generator is
+    created: the stream is built before the resume state is loaded, and the training loop
+    fills in skip["docs"] from the checkpoint before pulling the first batch. A resumed run
+    then continues from the document after the last one it finished, instead of replaying
+    the dataset from the start. The count is attached to each batch rather than written
+    back into the holder because the prefetch thread runs ahead of training; what gets
+    checkpointed must be the count for the batch actually consumed. The unused tail of the
+    document that was mid-way through tokenization at checkpoint time (at most
+    seq_len * 10 tokens) is dropped on resume.
     """
     dataset = load_dataset(dataset_name, split="train", streaming=True)
+    docs_consumed = (skip or {}).get("docs", 0)
+    if docs_consumed:
+        print(f"Skipping {docs_consumed:,} documents already consumed before the resume "
+              f"point (reads shards without tokenizing; minutes, not hours)")
+        dataset = dataset.skip(docs_consumed)
     token_buffer = []
 
     for example in dataset:
+        docs_consumed += 1
         tokens = model.tokenizer(
             example["text"], return_tensors="pt", truncation=True, max_length=seq_len * 10
         )["input_ids"][0]
@@ -391,7 +408,7 @@ def activation_stream_generator(model, dataset_name: str, hook_point: str, seq_l
                 )
                 acts = cache[hook_point].reshape(-1, cache[hook_point].shape[-1]).cpu()
 
-            yield acts  # (batch_size * seq_len, d_model)
+            yield acts, docs_consumed  # (batch_size * seq_len, d_model), docs read so far
 
 
 """## 2. Define SAE Architecture (TopK)
@@ -566,6 +583,7 @@ def load_shared_resume_state(checkpoint_dir: Path, arms: list, k_values: list, s
         return {
             "tokens_seen": min(c["tokens_seen"] for c in ckpts.values()),
             "step": min(c.get("step", 0) for c in ckpts.values()),
+            "docs_consumed": min(c.get("docs_consumed", 0) for c in ckpts.values()),
             "models": {a: c["model_state_dict"] for a, c in ckpts.items()},
             "optimizers": {a: c["optimizer_state_dict"] for a, c in ckpts.items()},
             "histories": {a: c.get("history", empty_history()) for a, c in ckpts.items()},
@@ -612,6 +630,7 @@ def train_arms_shared_stream(
     seed_repo_id=None,
     hub_checkpoint_prefix="checkpoints",
     hub_results_prefix="results",
+    stream_skip=None,
     checkpoint_every_seconds=CHECKPOINT_EVERY_SECONDS,
     log_every_steps=LOG_EVERY_STEPS,
 ):
@@ -642,6 +661,7 @@ def train_arms_shared_stream(
     histories = {a: empty_history() for a in arms}
     tokens_seen = 0
     step = 0
+    docs_consumed = 0
 
     hf_api = None
     if hf_repo_id is not None:
@@ -727,11 +747,19 @@ def train_arms_shared_stream(
             histories[a] = restored
         tokens_seen = resume["tokens_seen"]
         step = resume.get("step", 0)
+        docs_consumed = resume.get("docs_consumed", 0)
         print(f"Resumed all {len(arms)} arms at {tokens_seen:,} tokens")
-        print("CAVEAT: the activation stream restarts from the beginning of the dataset, so "
-              "tokens already trained on will be seen again. Past the first restart the "
-              "token counts measure optimization, not unique tokens. All arms replay the "
-              "same data, so cross-seed and cross-k comparisons stay valid.")
+        if docs_consumed and stream_skip is not None:
+            stream_skip["docs"] = docs_consumed
+            print(f"The activation stream will skip the {docs_consumed:,} documents consumed "
+                  f"before this point, so the token counts keep measuring unique tokens.")
+        else:
+            # Checkpoints written before the document count existed cannot say where the
+            # stream was, so the only option is the old behaviour: replay from the start.
+            print("CAVEAT: the activation stream restarts from the beginning of the dataset, "
+                  "so tokens already trained on will be seen again. Past the first restart "
+                  "the token counts measure optimization, not unique tokens. All arms replay "
+                  "the same data, so cross-seed and cross-k comparisons stay valid.")
 
     next_checkpoint_idx = sum(t <= tokens_seen for t in checkpoint_tokens)
     if next_checkpoint_idx >= len(checkpoint_tokens):
@@ -760,6 +788,7 @@ def train_arms_shared_stream(
             "optimizer_state_dict": optimizers[arm].state_dict(),
             "tokens_seen": tokens_seen,
             "step": step,
+            "docs_consumed": docs_consumed,
             "seed": seed,
             "k": k,
             "config": config,
@@ -770,6 +799,7 @@ def train_arms_shared_stream(
         return {
             "tokens_seen": tokens_seen,
             "step": step,
+            "docs_consumed": docs_consumed,
             "config": config,
             "models": {a: saes[a].state_dict() for a in arms},
             "optimizers": {a: optimizers[a].state_dict() for a in arms},
@@ -787,7 +817,7 @@ def train_arms_shared_stream(
     auxk_k = config["auxk_k"]
     dead_after = config["auxk_dead_after_tokens"]
 
-    for batch in activation_stream:
+    for batch, docs_consumed in activation_stream:
         batch = batch.to(device, non_blocking=True)
 
         for a in arms:
@@ -923,6 +953,9 @@ def train_arms_shared_stream(
 
 print(f"=== Training {len(ARMS)} arms ({len(K_VALUES)} k values x {len(SEEDS)} seeds) "
       f"on a shared activation stream ===")
+# Filled in by train_arms_shared_stream from the checkpoint before the first batch is
+# pulled; the generator reads it lazily, so creating the stream here is safe.
+STREAM_SKIP = {"docs": 0}
 stream = activation_stream_generator(
     model=model,
     dataset_name="monology/pile-uncopyrighted",
@@ -930,6 +963,7 @@ stream = activation_stream_generator(
     seq_len=CONFIG["seq_len"],
     batch_size=CONFIG["batch_size"],
     device=CONFIG["device"],
+    skip=STREAM_SKIP,
 )
 trained_saes, training_histories = train_arms_shared_stream(
     k_values=K_VALUES,
@@ -942,6 +976,7 @@ trained_saes, training_histories = train_arms_shared_stream(
     seed_repo_id=SEED_REPO_ID,
     hub_checkpoint_prefix=HUB_CHECKPOINT_PREFIX,
     hub_results_prefix=HUB_RESULTS_PREFIX,
+    stream_skip=STREAM_SKIP,
 )
 
 print(f"\nTrained {len(trained_saes)} SAEs: k={K_VALUES} x seeds={SEEDS}")
@@ -1078,7 +1113,7 @@ eval_stream = activation_stream_generator(
     device=CONFIG["device"],
 )
 N_EVAL_BATCHES = int(os.environ.get("SAE_EVAL_BATCHES") or 40)
-activations = torch.cat([next(eval_stream) for _ in range(N_EVAL_BATCHES)], dim=0)
+activations = torch.cat([next(eval_stream)[0] for _ in range(N_EVAL_BATCHES)], dim=0)
 print(f"Eval activations shape: {activations.shape} "
       f"({activations.numel() * 4 / 1e9:.1f} GB in host RAM)")
 
@@ -1627,6 +1662,25 @@ with open(OUTPUT_DIR / "config.json", "w") as fh:
 
 print(f"\nSaved sweep_summary.csv, sweep_summary.json, sweep_comparison.png and config.json "
       f"to {OUTPUT_DIR}")
+
+# Milestone checkpoints and training histories are mirrored as they are written, but
+# everything the analysis produces (the per-feature tables, the sweep summary, the plots)
+# used to stay on the training machine, and the 160m run's copies were lost with its pod.
+# The *.pt files are excluded: the milestones are already on the Hub and the final
+# sae_k*_seed*.pt duplicate them.
+if HF_REPO_ID:
+    try:
+        from huggingface_hub import HfApi
+        HfApi().upload_folder(
+            folder_path=str(OUTPUT_DIR), path_in_repo=HUB_RESULTS_PREFIX,
+            repo_id=HF_REPO_ID, repo_type="model",
+            allow_patterns=["*.csv", "*.json", "*.npz", "*.png"],
+            ignore_patterns=["checkpoints/*"],
+        )
+        print(f"Analysis outputs mirrored to hf.co/{HF_REPO_ID}/{HUB_RESULTS_PREFIX}")
+    except Exception as e:
+        print(f"WARNING: analysis upload failed ({type(e).__name__}: {e}); the outputs "
+              f"exist only in {OUTPUT_DIR} -- download them before this machine goes away")
 # Stable last line for notify_watch.sh: a watcher attached to a log cannot read the exit code
 # of a process it does not own, so a clean finish has to be recognisable from the log alone.
 # Without a sentinel it would have to key off incidental wording above and page on success.
