@@ -496,6 +496,27 @@ def load_decoder(found, k, seed, tokens, repo: str = DEFAULT_REPO) -> torch.Tens
     return F.normalize(state["W_dec"], dim=1)
 
 
+def load_exported_csv(k, budget: str = "at1B", repo: str = DEFAULT_REPO,
+                      prefix: str = DEFAULT_PREFIX):
+    """The per-feature table the sweep exported for one (k, budget) arm.
+
+    One row per latent of the anchor dictionary, carrying the labels (`reappearance_prob`,
+    `is_stable`, `is_unstable`), the firing counts the floor is applied to, and all six
+    predictors under the names `build_predictors` reads, so the frame's columns can be
+    handed to it directly.
+
+    An analysis that reads this needs no checkpoints, no activations and no GPU. The anchor
+    is seed 42: the sweep exported one table per arm, not one per seed.
+    """
+    from huggingface_hub import hf_hub_download
+    import pandas as pd
+
+    path = hf_hub_download(
+        repo, f"results/{prefix}/{budget}/feature_stability_k{k}.csv", repo_type="model"
+    )
+    return pd.read_csv(path)
+
+
 def random_rotation(d: int, rng: np.random.Generator) -> torch.Tensor:
     """Haar-uniform orthogonal matrix: destroys feature correspondence, preserves the
     dictionary's marginal geometry.

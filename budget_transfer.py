@@ -41,7 +41,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from huggingface_hub import hf_hub_download
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score
 from sklearn.preprocessing import StandardScaler
@@ -59,6 +58,7 @@ from sae_stats import (
     compute_single_run_statistics,
     cv_auroc,
     discover,
+    load_exported_csv,
     load_sae,
 )
 
@@ -379,10 +379,7 @@ def validate(found, k=64, seed=SOURCE_SEED, tokens=EXPENSIVE_TOKENS):
     a test of whether the eval token stream regenerated here is the stream the sweep saw.
     """
     print(f"Validating k={k} seed={seed} @ {tokens:,} against the exported CSV")
-    remote = hf_hub_download(
-        REPO, f"results/{PREFIX}/at1B/feature_stability_k{k}.csv", repo_type="model"
-    )
-    ref = pd.read_csv(remote)
+    ref = load_exported_csv(k, repo=REPO, prefix=PREFIX)
 
     if not stats_path(k, seed, tokens).exists():
         activations = eval_activations()
