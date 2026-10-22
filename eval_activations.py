@@ -32,7 +32,42 @@ PYTHIA_GEOMETRY = {
     "pythia-410m-deduped": (1024, 24),
     "pythia-1b-deduped": (2048, 16),
     "pythia-1.4b-deduped": (2048, 24),
+    # Not a Pythia model despite the dict's name, which is kept because four modules import
+    # it. GPT-2 small is the second-family transfer target: it has 160m's exact width and
+    # depth, so 70m -> gpt2 differs from 70m -> 160m in family alone.
+    "gpt2": (768, 12),
 }
+
+
+def drops_first_position(model_name: str) -> bool:
+    """Whether this model's activation streams drop position 0 of every sequence.
+
+    GPT-2 is known to put very large residual norms at the first position of a context,
+    whatever token sits there, and those outliers can dominate an SAE's reconstruction loss.
+    SAE_DROP_FIRST_POSITION_MODELS lists the models to drop it for (comma-separated, empty by
+    default, so every stream is unchanged unless asked). It is per model rather than a single
+    switch because cross_scale_transfer.py builds a source and a target stream in one
+    process, and dropping it for the source would silently change the 70m protocol.
+
+    Read on every call rather than at import, so the training script, the eval-set builder
+    and the statistics cache can never disagree about it.
+    """
+    listed = os.environ.get("SAE_DROP_FIRST_POSITION_MODELS") or ""
+    return model_name in {m.strip() for m in listed.split(",") if m.strip()}
+
+
+def stream_tag(model_name: str) -> str:
+    """Suffix for any file or run name derived from this model's activations, so a stream
+    with position 0 dropped can never be read back as one without it, or the reverse."""
+    return "_nopos0" if drops_first_position(model_name) else ""
+
+
+def flatten_positions(acts: torch.Tensor, drop_first: bool) -> torch.Tensor:
+    """(batch, seq, d_model) -> (batch * seq', d_model), with seq' = seq - 1 when dropping
+    position 0. Rows stay in token order either way."""
+    if drop_first:
+        acts = acts[:, 1:]
+    return acts.reshape(-1, acts.shape[-1])
 
 
 def relative_depth_layer(n_layers: int, rel_depth: float) -> int:
@@ -97,9 +132,11 @@ def build_eval_activations(model_name: str, hook_point: str, device: str,
     """Residual-stream activations at `hook_point`, cached to disk.
 
     Cached per (model, hook, size), so switching scales or shrinking the eval set never reads
-    the wrong file. Returns a (n_batches * BATCH_SIZE * SEQ_LEN, d_model) CPU tensor.
+    the wrong file. Returns a (n_batches * BATCH_SIZE * SEQ_LEN, d_model) CPU tensor, with
+    SEQ_LEN - 1 positions per sequence for a model listed in SAE_DROP_FIRST_POSITION_MODELS.
     """
-    tag = f"{model_name.replace('/', '_')}_{hook_point}_{n_batches}x{BATCH_SIZE}x{SEQ_LEN}"
+    tag = (f"{model_name.replace('/', '_')}_{hook_point}_{n_batches}x{BATCH_SIZE}x{SEQ_LEN}"
+           f"{stream_tag(model_name)}")
     cache = Path(cache_dir) / f"eval_activations_{tag}.pt"
     if cache.exists():
         acts = torch.load(cache, map_location="cpu")
@@ -113,6 +150,9 @@ def build_eval_activations(model_name: str, hook_point: str, device: str,
           f"({n_tokens:,} tokens) on {device}")
     model = load_model(model_name, device)
     layer_idx = int(hook_point.split(".")[1])
+    drop_first = drops_first_position(model_name)
+    if drop_first:
+        print("  dropping position 0 of every sequence (SAE_DROP_FIRST_POSITION_MODELS)")
 
     dataset = load_dataset(DATASET, split="train", streaming=True)
     token_buffer, batches = [], []
@@ -134,8 +174,7 @@ def build_eval_activations(model_name: str, hook_point: str, device: str,
                     names_filter=[hook_point],
                     stop_at_layer=layer_idx + 1,
                 )
-                a = cached[hook_point]
-                batches.append(a.reshape(-1, a.shape[-1]).cpu())
+                batches.append(flatten_positions(cached[hook_point], drop_first).cpu())
             print(f"  batch {len(batches)}/{n_batches}", end="\r")
         if len(batches) >= n_batches:
             break

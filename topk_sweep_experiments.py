@@ -74,7 +74,12 @@ from sae_stats import (  # noqa: F401  (re-exported for scripts importing from h
 # PYTHIA_GEOMETRY holds (d_model, n_layers) per model, needed before the model is loaded
 # because the run directory and the dictionary width depend on it. Asserted against the loaded
 # model below, so a wrong entry fails immediately instead of mislabelling a run.
-from eval_activations import PYTHIA_GEOMETRY, relative_depth_layer
+from eval_activations import (
+    PYTHIA_GEOMETRY,
+    drops_first_position,
+    flatten_positions,
+    relative_depth_layer,
+)
 
 # Which model to train on. The 70m default reproduces the original sweep exactly.
 MODEL_NAME = os.environ.get("SAE_MODEL") or "pythia-70m-deduped"
@@ -142,6 +147,10 @@ CONFIG = {
     # knob to reach for if a smaller GPU runs out rather than dropping an arm.
     "batch_size": int(os.environ.get("SAE_BATCH_SIZE") or 256),
     "seq_len": int(os.environ.get("SAE_SEQ_LEN") or 128),
+    # Off unless SAE_DROP_FIRST_POSITION_MODELS lists this model (see eval_activations). On,
+    # every batch carries seq_len - 1 positions per sequence; tokens_seen counts the rows
+    # actually yielded, so milestones still mean tokens trained on.
+    "drop_first_position": drops_first_position(MODEL_NAME),
     # Three seeds, matching the 1B-8B L1 runs and the published comparison. The sweep already
     # triples the SAE work per seed, and reappearance probability over two comparisons gives
     # the same three levels (0, 0.5, 1) the existing ground truth has.
@@ -280,6 +289,10 @@ if CONFIG["tied_init"]:
     _objective_tag += "_tied"
 if CONFIG["auxk_coeff"]:
     _objective_tag += "_auxk"
+# A different input stream is a different objective, so it gets its own run directory and Hub
+# prefix rather than sharing one with checkpoints trained on every position.
+if CONFIG["drop_first_position"]:
+    _objective_tag += "_nopos0"
 RUN_NAME = f"{CONFIG['model_name']}_L{_layer}_{_objective_tag}"
 OUTPUT_DIR = Path(RESULTS_BASE) / RUN_NAME
 
@@ -358,7 +371,8 @@ print(f"  hook {CONFIG['hook_point']} = layer {_LAYER} of {_N_LAYERS} "
 
 
 def activation_stream_generator(model, dataset_name: str, hook_point: str, seq_len: int,
-                                batch_size: int, device: str, skip: dict | None = None):
+                                batch_size: int, device: str, skip: dict | None = None,
+                                drop_first_position: bool = False):
     """
     Infinite generator yielding (activations, docs_consumed) pairs, where activations is a
     (batch_size * seq_len, d_model) tensor and docs_consumed counts the dataset documents
@@ -376,6 +390,9 @@ def activation_stream_generator(model, dataset_name: str, hook_point: str, seq_l
     checkpointed must be the count for the batch actually consumed. The unused tail of the
     document that was mid-way through tokenization at checkpoint time (at most
     seq_len * 10 tokens) is dropped on resume.
+
+    `drop_first_position` removes position 0 of every sequence after the forward pass, so
+    the model still sees the full context; the token stream itself is unchanged.
     """
     dataset = load_dataset(dataset_name, split="train", streaming=True)
     docs_consumed = (skip or {}).get("docs", 0)
@@ -406,9 +423,9 @@ def activation_stream_generator(model, dataset_name: str, hook_point: str, seq_l
                     names_filter=[hook_point],
                     stop_at_layer=layer_idx + 1,
                 )
-                acts = cache[hook_point].reshape(-1, cache[hook_point].shape[-1]).cpu()
+                acts = flatten_positions(cache[hook_point], drop_first_position).cpu()
 
-            yield acts, docs_consumed  # (batch_size * seq_len, d_model), docs read so far
+            yield acts, docs_consumed  # (batch_size * seq_len', d_model), docs read so far
 
 
 """## 2. Define SAE Architecture (TopK)
@@ -964,6 +981,7 @@ stream = activation_stream_generator(
     batch_size=CONFIG["batch_size"],
     device=CONFIG["device"],
     skip=STREAM_SKIP,
+    drop_first_position=CONFIG["drop_first_position"],
 )
 trained_saes, training_histories = train_arms_shared_stream(
     k_values=K_VALUES,
@@ -1111,6 +1129,7 @@ eval_stream = activation_stream_generator(
     seq_len=CONFIG["seq_len"],
     batch_size=CONFIG["batch_size"],
     device=CONFIG["device"],
+    drop_first_position=CONFIG["drop_first_position"],
 )
 N_EVAL_BATCHES = int(os.environ.get("SAE_EVAL_BATCHES") or 40)
 activations = torch.cat([next(eval_stream)[0] for _ in range(N_EVAL_BATCHES)], dim=0)

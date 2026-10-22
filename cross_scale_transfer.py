@@ -59,6 +59,7 @@ from eval_activations import (
     build_eval_activations,
     hook_point_for,
     hub_prefix_for,
+    stream_tag,
 )
 from sae_stats import (
     DEFAULT_PREFIX,
@@ -88,8 +89,11 @@ STAT_KEYS = ("activation_freq", "mean_activation", "firing_counts", "geometric_i
 
 
 def stats_path(model, k, seed, tokens):
+    # stream_tag is empty unless position 0 is dropped for this model, so every existing
+    # cache name is unchanged; a flagged model's statistics get a name of their own.
     return (CACHE_DIR /
-            f"stats_{model}_k{k}_seed{seed}_t{tokens}_e{N_EVAL_BATCHES}.npz")
+            f"stats_{model}_k{k}_seed{seed}_t{tokens}_e{N_EVAL_BATCHES}"
+            f"{stream_tag(model)}.npz")
 
 
 class ModelGrid:
